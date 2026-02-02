@@ -27,12 +27,6 @@ def run(cmd: List[str], env: Optional[Dict[str, str]] = None, check: bool = True
         )
     return (p.stdout or "").strip()
 
-def atomic_write_json(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=2) + "\n")
-    os.replace(str(tmp), str(path))
-
 
 def psql(
     host: str,
