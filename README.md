@@ -2,7 +2,7 @@ Here’s that text cleanly formatted as a proper **README.md** and **LICENSE** f
 
 ***
 
-```markdown
+
 # whpg_dr_sync
 
 **Deterministic DR synchronization for Greenplum / WHPG using restore points and WAL archives.**
