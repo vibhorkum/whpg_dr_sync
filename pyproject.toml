@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whpg_dr_sync"
+version = "0.1.0"
+description = "WHPG/Greenplum DR sync: restore-point publisher (primary) and manifest consumer (DR)."
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+whpg_dr_sync = "whpg_dr_sync.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,14 @@
+[Unit]
+Description=WHPG DR Sync - Primary Publisher
+After=network.target
+
+[Service]
+Type=simple
+User=gpadmin
+WorkingDirectory=/home/gpadmin
+ExecStart=/usr/bin/env whpg_dr_sync --config /home/gpadmin/dr_sync_config.json primary run
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
