@@ -1,0 +1,29 @@
+[Unit]
+Description=whpg_dr_sync (DR Consumer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gpadmin
+Group=gpadmin
+
+EnvironmentFile=-/etc/whpg_dr_sync/whpg_dr_sync.env
+WorkingDirectory=/var/lib/whpg_dr_sync
+
+# Consumer loop
+ExecStart=/usr/bin/env bash -lc 'whpg_dr_sync dr run --config "${WHPG_DR_SYNC_CONFIG}" ${WHPG_DR_SYNC_ARGS}'
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

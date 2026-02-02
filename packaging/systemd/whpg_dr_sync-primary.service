@@ -1,0 +1,32 @@
+[Unit]
+Description=whpg_dr_sync (Primary Publisher)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gpadmin
+Group=gpadmin
+
+EnvironmentFile=-/etc/whpg_dr_sync/whpg_dr_sync.env
+WorkingDirectory=/var/lib/whpg_dr_sync
+
+# Publisher loop
+ExecStart=/usr/bin/env bash -lc 'whpg_dr_sync primary run --config "${WHPG_DR_SYNC_CONFIG}" ${WHPG_DR_SYNC_ARGS}'
+
+Restart=always
+RestartSec=5
+
+# Logs go to journald by default (recommended).
+# If you prefer file logs, see OPERATIONS.md for StandardOutput=append.
+StandardOutput=journal
+StandardError=journal
+
+# Safety hardening (tune if needed)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
