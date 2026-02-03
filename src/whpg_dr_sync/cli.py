@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .config import load_config
 from .service import status as pid_status, stop as pid_stop
+from .common import ShutdownRequested, install_signal_handlers
 
 
 def _tail_file(path: Path, n: int = 50) -> None:
@@ -43,11 +44,18 @@ def main() -> int:
     sp_dr.add_parser("stop", help="Stop daemon (pidfile mode)")
     sp_dr.add_parser("pid-status", help="Show pidfile status (pidfile mode)")
 
+    # Enhanced status (backward compatible)
     d_status = sp_dr.add_parser("status", help="Show DR state (current restore point + latest receipt)")
+    d_status.add_argument("--format", choices=["table", "prometheus", "json"], default="table")
+    d_status.add_argument("--include-history", action="store_true", help="Include recent receipts summary")
+    d_status.add_argument("--history-n", type=int, default=10, help="How many receipts to scan (default: 10)")
+    d_status.add_argument("--name", default="whpg_dr_sync", help="Metric prefix/name for prometheus output")
+
     d_logs = sp_dr.add_parser("logs", help="Tail receipts directory")
     d_logs.add_argument("--n", type=int, default=50)
 
     args = ap.parse_args()
+    install_signal_handlers()
     cfg = load_config(args.config)
 
     if args.mode == "primary":
@@ -57,11 +65,18 @@ def main() -> int:
             if args.once:
                 publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
                 return 0
+
             while True:
                 try:
                     publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
                 except Exception as e:
                     print(f"[PRIMARY] ERROR: {e}", file=sys.stderr)
+                except ShutdownRequested as e:
+                    print(f"[stop] {e.reason}")
+                    return e.code
+               except KeyboardInterrupt:
+                    print("[stop] keyboard_interrupt")
+                    return 0
                 time.sleep(cfg.publisher_sleep_secs)
         return 0
 
@@ -74,21 +89,6 @@ def main() -> int:
             pid_status(cfg, "dr")
             return 0
 
-        if args.cmd == "status":
-            state_file = Path(cfg.state_dir) / "current_restore_point.txt"
-            rp = state_file.read_text().strip() if state_file.exists() else ""
-            print(f"[DR] current_restore_point={rp or '(missing)'}")
-
-            receipts = sorted(Path(cfg.receipts_dir).glob("*.receipt.json"))
-            if not receipts:
-                print("[DR] no receipts yet")
-                return 0
-
-            latest = receipts[-1]
-            print(f"[DR] latest_receipt={latest.name}")
-            _tail_file(latest, n=80)
-            return 0
-
         if args.cmd == "logs":
             receipts = sorted(Path(cfg.receipts_dir).glob("*.receipt.json"))
             if not receipts:
@@ -97,6 +97,22 @@ def main() -> int:
             latest = receipts[-1]
             print(f"[DR] tailing latest receipt: {latest}")
             _tail_file(latest, n=args.n)
+            return 0
+
+        if args.cmd == "status":
+            # New richer status; still “feels” like your old status by default
+            from .status import render_status
+
+            out = render_status(
+                cfg=cfg,
+                fmt=args.format,
+                include_history=bool(args.include_history),
+                history_n=int(args.history_n),
+                metric_name=str(args.name),
+            )
+            sys.stdout.write(out)
+            if not out.endswith("\n"):
+                sys.stdout.write("\n")
             return 0
 
         if args.cmd == "run":

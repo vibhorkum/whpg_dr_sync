@@ -10,8 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .common import atomic_write_json, run, utc_now_iso
-from .config import Config, Instance
+from .common import (
+    ShutdownRequested,
+    atomic_write_json,
+    check_stop,
+    run,
+    utc_now_iso,
+)
+from .config import Config
 
 
 # =============================
@@ -19,11 +25,6 @@ from .config import Config, Instance
 # =============================
 def sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
-
-
-def ssh_bash(host: str, script: str, check: bool = True) -> str:
-    cmd = f"bash --noprofile --norc -lc {sh_quote(script)}"
-    return run(["ssh", host, cmd], check=check)
 
 
 def gpssh_bash(host: str, script: str, check: bool = True) -> str:
@@ -96,7 +97,7 @@ def lsn_to_int(lsn: str) -> int:
     if not s or s == "0/0":
         return 0
     if "/" not in s:
-        raise ValueError("Invalid pg_lsn: {}".format(lsn))
+        raise ValueError(f"Invalid pg_lsn: {lsn}")
     x, y = s.split("/", 1)
     return (int(x, 16) << 32) + int(y, 16)
 
@@ -177,6 +178,7 @@ def _pg_ctl_stop(inst: DrInstance, gp_home: str) -> None:
         )
         run(["bash", "-lc", cmd], check=False)
         return
+
     cmd = f"source {gp_home}/greenplum_path.sh && pg_ctl -D {inst.data_dir} stop -m fast"
     gpssh_bash(inst.host, cmd, check=False)
 
@@ -190,6 +192,7 @@ def _pg_ctl_start(inst: DrInstance, gp_home: str) -> None:
         )
         run(["bash", "-lc", cmd], check=False)
         return
+
     cmd = (
         f"source {gp_home}/greenplum_path.sh && "
         f"pg_ctl -D {inst.data_dir} -o \"-c gp_role=utility -c port={inst.port}\" start -l start.log"
@@ -229,7 +232,7 @@ def get_recovery_floors(instances: Dict[int, DrInstance], gp_home: str, user: st
 
 
 # =============================
-# Manifest selection helpers
+# Manifest selection
 # =============================
 def list_manifest_paths(manifest_dir: Path) -> List[Path]:
     return sorted(manifest_dir.glob("sync_point_*.json"))
@@ -267,9 +270,14 @@ def load_all_ready_manifests(manifest_dir: Path) -> List[dict]:
     return out
 
 
-def pick_best_manifest(manifest_dir: Path, latest_path: Path, floors: Dict[int, str]) -> Tuple[Optional[dict], str, List[str]]:
+def pick_best_manifest(
+    manifest_dir: Path,
+    latest_path: Path,
+    floors: Dict[int, str],
+) -> Tuple[Optional[dict], str, List[str]]:
     diags: List[str] = []
     latest = None
+
     if latest_path.exists():
         try:
             latest = json.loads(latest_path.read_text())
@@ -288,7 +296,7 @@ def pick_best_manifest(manifest_dir: Path, latest_path: Path, floors: Dict[int, 
     if not ready:
         return None, "no ready manifests exist", diags
 
-    for m in ready:
+    for m in ready:  # earliest first
         ok, _ = manifest_satisfies_floors(m, floors)
         if ok:
             return m, "selected earliest READY manifest at/after floors", diags
@@ -312,9 +320,11 @@ def set_current_restore_point(state_file: Path, rp: str) -> None:
 
 
 # =============================
-# Consumer cycle (your logic)
+# Consumer cycle
 # =============================
 def _cycle(cfg: Config, target: str = "LATEST") -> int:
+    check_stop()
+
     user = cfg.primary_user
     db = cfg.primary_db
 
@@ -337,6 +347,7 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     else:
         print("[DR] WARNING: Could not compute recovery floors.")
 
+    # Select target manifest
     if target != "LATEST":
         p = manifest_dir / f"{target}.json"
         if not p.exists():
@@ -371,53 +382,72 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
 
     target_lsns = {int(s["gp_segment_id"]): str(s["restore_lsn"]).strip() for s in target_manifest["segments"]}
 
+    # Apply
     print("[DR] Applying recovery_target_lsn (per instance) and recovery_target_action='shutdown' + start...")
     for seg_id, inst in instances.items():
+        check_stop()
         tgt_lsn = target_lsns.get(seg_id)
         if not tgt_lsn:
             raise RuntimeError(f"[DR][seg={seg_id}] target manifest missing restore_lsn")
         print(f"[DR][seg={seg_id}] apply target_lsn={tgt_lsn} and start")
+
         ensure_standby_signal(inst)
         set_recovery_target_action_shutdown(inst)
         set_recovery_target_lsn(inst, tgt_lsn)
+
         _pg_ctl_stop(inst, cfg.gp_home)
         time.sleep(1)
         _pg_ctl_start(inst, cfg.gp_home)
 
-    print(f"[DR] Waiting for shutdown-at-target confirmation (max_wait_secs={cfg.consumer_wait_reach_secs} poll_secs={cfg.consumer_reach_poll_secs})...")
+    # Wait for DOWN (shutdown target means "parked")
+    print(
+        f"[DR] Waiting for shutdown-at-target confirmation "
+        f"(max_wait_secs={cfg.consumer_wait_reach_secs} poll_secs={cfg.consumer_reach_poll_secs})..."
+    )
+
     waited = 0
     while waited <= cfg.consumer_wait_reach_secs:
+        check_stop()
+
         all_down = True
         for seg_id, inst in instances.items():
             ok, _, _ = try_sql(inst.host, inst.port, user, db, "SELECT 1;")
             if ok:
                 all_down = False
+
         if all_down:
-            print(f"[DR] ✅ All instances appear DOWN (expected after shutdown target). Advancing state.")
+            print("[DR] ✅ All instances appear DOWN (expected after shutdown target). Advancing state.")
             set_current_restore_point(current_state_file, target_rp)
-            atomic_write_json(receipts_dir / f"{target_rp}.receipt.json", {
-                "current_restore_point": current_rp,
-                "target_restore_point": target_rp,
-                "checked_at_utc": utc_now_iso(),
-                "mode": "shutdown",
-                "status": "reached_then_shutdown_best_effort",
-                "waited_secs": waited,
-                "target_lsns": {str(k): v for k, v in target_lsns.items()},
-            })
+            atomic_write_json(
+                receipts_dir / f"{target_rp}.receipt.json",
+                {
+                    "current_restore_point": current_rp,
+                    "target_restore_point": target_rp,
+                    "checked_at_utc": utc_now_iso(),
+                    "mode": "shutdown",
+                    "status": "reached_then_shutdown_best_effort",
+                    "waited_secs": waited,
+                    "target_lsns": {str(k): v for k, v in target_lsns.items()},
+                },
+            )
             return 0
+
         time.sleep(cfg.consumer_reach_poll_secs)
         waited += cfg.consumer_reach_poll_secs
 
     print("[DR] Timeout. Will retry next cycle.")
-    atomic_write_json(receipts_dir / f"{target_rp}.receipt.json", {
-        "current_restore_point": current_rp,
-        "target_restore_point": target_rp,
-        "checked_at_utc": utc_now_iso(),
-        "mode": "shutdown",
-        "status": "timeout",
-        "waited_secs": waited,
-        "target_lsns": {str(k): v for k, v in target_lsns.items()},
-    })
+    atomic_write_json(
+        receipts_dir / f"{target_rp}.receipt.json",
+        {
+            "current_restore_point": current_rp,
+            "target_restore_point": target_rp,
+            "checked_at_utc": utc_now_iso(),
+            "mode": "shutdown",
+            "status": "timeout",
+            "waited_secs": waited,
+            "target_lsns": {str(k): v for k, v in target_lsns.items()},
+        },
+    )
     return 0
 
 
@@ -427,15 +457,19 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
 def run_once(cfg: Config, target: str = "LATEST") -> int:
     try:
         return _cycle(cfg, target=target)
+    except ShutdownRequested as e:
+        print(f"[stop] {e.reason}")
+        return e.code
     except Exception as e:
         print(f"[DR] ERROR: {e}", file=sys.stderr)
         return 2
 
 
 def run_daemon(cfg: Config, target: str = "LATEST") -> int:
-    while True:
-        try:
+    try:
+        while True:
             _cycle(cfg, target=target)
-        except Exception as e:
-            print(f"[DR] ERROR: {e}", file=sys.stderr)
-        time.sleep(cfg.consumer_sleep_secs)
+            time.sleep(cfg.consumer_sleep_secs)
+    except ShutdownRequested as e:
+        print(f"[stop] {e.reason}")
+        return e.code
