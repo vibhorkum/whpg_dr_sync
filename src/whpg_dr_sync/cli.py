@@ -108,22 +108,36 @@ def main() -> int:
                     publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
                     return 0
                 return run_daemon(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
-            #if args.once:
-            #    publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
-            #    return 0
 
-            # while True:
-            #    try:
-            #        publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
-            #    except Exception as e:
-            #        print(f"[PRIMARY] ERROR: {e}", file=sys.stderr)
-            #    except ShutdownRequested as e:
-            #        print(f"[stop] {e.reason}")
-            #        return e.code
-            #    except KeyboardInterrupt:
-            #        print("[stop] keyboard_interrupt")
-            #        return 0
-            #    time.sleep(cfg.publisher_sleep_secs)
+        if args.cmd == "logs":
+            latest = Path(cfg.latest_path)
+            manifest_dir = Path(cfg.manifest_dir)
+
+            # 1) Show LATEST.json (most important)
+            print(f"[PRIMARY] tailing LATEST: {latest}")
+            _tail_file(latest, n=args.n)
+
+            # 2) Also show newest manifest file (by mtime)
+            manifests = sorted(
+                manifest_dir.glob("sync_point_*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not manifests:
+                print(f"[PRIMARY] no manifests found in {manifest_dir}")
+                print("[PRIMARY] NOTE: primary logs are manifests (JSON), not receipts.")
+                return 0
+
+            newest = manifests[0]
+            # Avoid duplicating if newest == latest_path (in case you store LATEST inside manifest_dir)
+            if newest.resolve() != latest.resolve():
+                print(f"\n[PRIMARY] tailing newest manifest: {newest.name}")
+                _tail_file(newest, n=args.n)
+
+            print("\n[PRIMARY] TIP: if running under systemd, use:")
+            print("  journalctl -u whpg_dr_sync-primary -n 200 --no-pager")
+            return 0
+
         return 0
 
     if args.mode == "dr":
