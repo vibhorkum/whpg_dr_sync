@@ -14,6 +14,35 @@ from .common import atomic_write_json, run, utc_now_iso
 from .config import Config
 
 
+def _tail_stop_signature(inst: DrInstance, target_lsn: str) -> bool:
+    """
+    Look for evidence that recovery stopped at/after target LSN.
+    (Greenplum logs this as 'recovery stopping after WAL location (LSN) "X/Y"')
+    """
+    logdir = f"{inst.data_dir}/log"
+    # newest csv, grep a few key lines
+    script = (
+        f"set -euo pipefail; "
+        f"f=$(ls -1t {sh_quote(logdir)}/*.csv 2>/dev/null | head -n 1 || true); "
+        f"if [ -z \"$f\" ]; then exit 1; fi; "
+        f"tail -n 200 \"$f\" | egrep -n 'recovery stopping|WAL location|database system is shut down' || true"
+    )
+    out = run(["bash", "-lc", script], check=False) if inst.is_local else gpssh_bash(inst.host, script, check=False)
+    if not out:
+        return False
+
+    # If we can parse a stopping LSN, compare it
+    m = re.search(r'after WAL location \(LSN\)\s+""?([0-9A-Fa-f]+/[0-9A-Fa-f]+)""?', out)
+    if m:
+        stopped_lsn = m.group(1).strip()
+        return lsn_ge(stopped_lsn, target_lsn)
+
+    # Fallback: if system is shut down and we saw stopping message
+    if "database system is shut down" in out and "recovery stopping" in out:
+        return True
+
+    return False
+
 # =============================
 # Shell helpers
 # =============================
@@ -374,29 +403,43 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
         f"[DR] Waiting for shutdown-at-target confirmation "
         f"(max_wait_secs={cfg.consumer_wait_reach_secs} poll_secs={cfg.consumer_reach_poll_secs})..."
     )
+
     waited = 0
     while waited <= cfg.consumer_wait_reach_secs:
-        all_down = True
-        for _, inst in instances.items():
-            ok, _, _ = try_sql(inst.host, inst.port, user, db, "SELECT 1;")
-            if ok:
-                all_down = False
+        all_done = True
 
-        if all_down:
-            print("[DR] ✅ All instances appear DOWN (expected after shutdown target). Advancing state.")
+        for seg_id, inst in instances.items():
+            tgt_lsn = target_lsns[seg_id]
+
+            ok, inrec, err = try_sql(inst.host, inst.port, user, db, "SELECT pg_is_in_recovery();")
+            if ok:
+                # Instance is UP
+                ok2, replay, _ = try_sql(inst.host, inst.port, user, db, "SELECT pg_last_wal_replay_lsn();")
+                replay_s = (replay or "").strip() if ok2 else "?"
+                reached = lsn_ge(replay_s, tgt_lsn) if replay_s != "?" else False
+                print(f"[DR][seg={seg_id}] UP; replay_lsn={replay_s} target_lsn={tgt_lsn} reached={reached} in_recovery={inrec}")
+                all_done = False
+                continue
+
+            # Instance is DOWN/unreachable by SQL (expected final state)
+            if _tail_stop_signature(inst, tgt_lsn):
+                print(f"[DR][seg={seg_id}] DOWN; stop signature confirmed at/after target_lsn={tgt_lsn}")
+            else:
+                print(f"[DR][seg={seg_id}] DOWN; but no stop signature yet (or logs not readable). err={err or '-'}")
+                all_done = False
+
+        if all_done:
+            print(f"[DR] ✅ All instances confirmed stopped at/after target. Advancing state to {target_rp}.")
             set_current_restore_point(current_state_file, target_rp)
-            atomic_write_json(
-                receipts_dir / f"{target_rp}.receipt.json",
-                {
-                    "current_restore_point": current_rp,
-                    "target_restore_point": target_rp,
-                    "checked_at_utc": utc_now_iso(),
-                    "mode": "shutdown",
-                    "status": "reached_then_shutdown_best_effort",
-                    "waited_secs": waited,
-                    "target_lsns": {str(k): v for k, v in target_lsns.items()},
-                },
-            )
+            atomic_write_json(receipts_dir / f"{target_rp}.receipt.json", {
+                "current_restore_point": current_rp,
+                "target_restore_point": target_rp,
+                "checked_at_utc": utc_now_iso(),
+                "mode": "shutdown",
+                "status": "reached_then_shutdown",
+                "waited_secs": waited,
+                "target_lsns": {str(k): v for k, v in target_lsns.items()},
+            })
             return 0
 
         time.sleep(cfg.consumer_reach_poll_secs)
