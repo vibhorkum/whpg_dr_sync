@@ -1,8 +1,9 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import sys
 import time
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,9 +76,13 @@ def create_restore_point_with_hosts(primary: PrimaryConn, restore_name: str) -> 
     return rows
 
 
-def wal_file_for_lsn_on_instance(
-    primary: PrimaryConn, seg_id: int, seg_host: str, seg_port: int, lsn: str
-) -> str:
+def wal_file_for_lsn_on_instance(primary: PrimaryConn, seg_id: int, seg_host: str, seg_port: int, lsn: str) -> str:
+    """
+    IMPORTANT:
+    LSN->WAL filename must be computed on the *owning instance*.
+      - coordinator (-1): run on coordinator (normal psql)
+      - segment (>=0): run on that segment instance (utility mode)
+    """
     sql = f"SELECT pg_walfile_name('{lsn}');"
     if seg_id == -1:
         return psql(primary.host, primary.port, primary.user, primary.db, sql).strip()
@@ -153,9 +158,11 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
     print(f"---- {ts} ----")
     print(f"[PRIMARY] restore_point={restore_name}")
 
+    # 1) Create restore point and map each gp_segment_id to its primary host/port
     print("[PRIMARY] gp_create_restore_point() + primary host mapping...")
     rp_rows = create_restore_point_with_hosts(primary, restore_name)
 
+    # 2) Compute WAL file name on the owning instance (critical correctness!)
     targets: List[Dict[str, Any]] = []
     for r in rp_rows:
         seg_id = int(r["gp_segment_id"])
@@ -176,13 +183,14 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
             }
         )
 
+    # 3) Force WAL switch AFTER restore point (encourages archiving)
     switch_rows: List[Dict[str, Any]] = []
     if not once_no_gp_switch_wal:
         print("[PRIMARY] gp_switch_wal() on coordinator + segments (after restore point)...")
         switch_rows = gp_switch_wal(primary)
 
+    # 4) Publish pending manifest immediately (audit trail)
     archiver = archiver_stats_cluster(primary)
-
     manifest = {
         "restore_point": restore_name,
         "created_at_utc": ts,
@@ -206,25 +214,30 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
     atomic_write_json(latest_path, manifest)
     print(f"[PRIMARY] Published pending manifest {out_path} (ready=False)")
 
+    # 5) Poll until WAL exists on each source host (bounded)
     print("[PRIMARY] Waiting for per-segment WAL files to appear in remote archive sources...")
     waited = 0
     ready = False
 
-    while waited <= cfg.archive_wait_max_secs:
-        all_present = True
-        for t in targets:
-            remote_path = f"{t['archive_dir']}/{t['wal_file']}"
-            present = ssh_test_file(t["archive_source_host"], remote_path)
-            t["wal_present"] = present
-            if not present:
-                all_present = False
+    try:
+        while waited <= cfg.archive_wait_max_secs:
+            all_present = True
+            for t in targets:
+                remote_path = f"{t['archive_dir']}/{t['wal_file']}"
+                present = ssh_test_file(t["archive_source_host"], remote_path)
+                t["wal_present"] = present
+                if not present:
+                    all_present = False
 
-        if all_present:
-            ready = True
-            break
+            if all_present:
+                ready = True
+                break
 
-        time.sleep(cfg.archive_poll_interval_secs)
-        waited += cfg.archive_poll_interval_secs
+            time.sleep(cfg.archive_poll_interval_secs)
+            waited += cfg.archive_poll_interval_secs
+    except KeyboardInterrupt:
+        print("\n[PRIMARY] stop requested (Ctrl+C) during archive wait. Publishing manifest as-is and exiting.")
+        # fall through: we still rewrite manifest with current wal_present bits
 
     manifest["ready"] = ready
     manifest["evidence"]["archive_wait"]["waited_secs"] = waited

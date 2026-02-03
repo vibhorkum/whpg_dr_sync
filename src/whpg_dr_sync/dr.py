@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
@@ -14,35 +15,6 @@ from .common import atomic_write_json, run, utc_now_iso
 from .config import Config
 
 
-def _tail_stop_signature(inst: DrInstance, target_lsn: str) -> bool:
-    """
-    Look for evidence that recovery stopped at/after target LSN.
-    (Greenplum logs this as 'recovery stopping after WAL location (LSN) "X/Y"')
-    """
-    logdir = f"{inst.data_dir}/log"
-    # newest csv, grep a few key lines
-    script = (
-        f"set -euo pipefail; "
-        f"f=$(ls -1t {sh_quote(logdir)}/*.csv 2>/dev/null | head -n 1 || true); "
-        f"if [ -z \"$f\" ]; then exit 1; fi; "
-        f"tail -n 200 \"$f\" | egrep -n 'recovery stopping|WAL location|database system is shut down' || true"
-    )
-    out = run(["bash", "-lc", script], check=False) if inst.is_local else gpssh_bash(inst.host, script, check=False)
-    if not out:
-        return False
-
-    # If we can parse a stopping LSN, compare it
-    m = re.search(r'after WAL location \(LSN\)\s+""?([0-9A-Fa-f]+/[0-9A-Fa-f]+)""?', out)
-    if m:
-        stopped_lsn = m.group(1).strip()
-        return lsn_ge(stopped_lsn, target_lsn)
-
-    # Fallback: if system is shut down and we saw stopping message
-    if "database system is shut down" in out and "recovery stopping" in out:
-        return True
-
-    return False
-
 # =============================
 # Shell helpers
 # =============================
@@ -50,16 +22,29 @@ def sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
 
+def ssh_bash(host: str, script: str, check: bool = True) -> str:
+    cmd = f"bash --noprofile --norc -lc {sh_quote(script)}"
+    return run(["ssh", host, cmd], check=check)
+
+
 def gpssh_bash(host: str, script: str, check: bool = True) -> str:
+    # NOTE: no -q (some environments don’t support it)
     cmd = f"bash --noprofile --norc -lc {sh_quote(script)}"
     return run(["gpssh", "-h", host, "-e", cmd], check=check)
 
 
 def rewrite_conf_kv(conf_path: str, key: str, value_line: str) -> str:
+    """
+    Atomic config rewrite (no sed portability issues):
+      - remove any lines matching '^key[[:space:]]*='
+      - append value_line
+      - write to tmp then mv
+    """
     k = sh_quote(key)
     v = sh_quote(value_line)
     c = sh_quote(conf_path)
     tmp = sh_quote(conf_path + ".tmp")
+
     return (
         f"set -euo pipefail; "
         f"conf={c}; tmp={tmp}; "
@@ -151,6 +136,99 @@ def load_instances(cfg: Config) -> Dict[int, DrInstance]:
 
 
 # =============================
+# Stop-signature detection
+# =============================
+_STOP_LSN_RE = re.compile(
+    r'recovery stopping after WAL location \(LSN\)\s+""?([0-9A-Fa-f]+/[0-9A-Fa-f]+)""?'
+)
+
+
+def _extract_latest_stop_lsn(text: str) -> Optional[str]:
+    """
+    Given log text, return the last (most recent in the text stream) stop LSN found.
+    """
+    last: Optional[str] = None
+    for m in _STOP_LSN_RE.finditer(text):
+        last = m.group(1).strip()
+    return last
+
+
+def _tail_stop_signature(inst: DrInstance, target_lsn: str, scan_files: int = 6, tail_lines: int = 400) -> bool:
+    """
+    Look for evidence that recovery stopped at/after target LSN.
+
+    IMPORTANT FIX:
+      - we scan the last N newest csv files, not only the newest,
+        because the “newest” file can be stale or not the file that captured the stop.
+    """
+    logdir = f"{inst.data_dir}/log"
+
+    # Print a small filtered view from multiple files (newest first).
+    # We echo file boundaries so the caller can debug quickly if needed.
+    script = (
+        f"set -euo pipefail; "
+        f"ld={sh_quote(logdir)}; "
+        f"files=$(ls -1t \"$ld\"/*.csv 2>/dev/null | head -n {int(scan_files)} || true); "
+        f"if [ -z \"$files\" ]; then exit 1; fi; "
+        f"for f in $files; do "
+        f"  echo \"--- $f ---\"; "
+        f"  tail -n {int(tail_lines)} \"$f\" | egrep -n "
+        f"'recovery stopping after WAL location|database system is shut down|requested WAL|could not open file|restore_command|FATAL|PANIC|ERROR|archive' || true; "
+        f"done"
+    )
+
+    out = (
+        run(["bash", "-lc", script], check=False)
+        if inst.is_local
+        else ssh_bash(inst.host, script, check=False)
+    )
+    if not out:
+        return False
+
+    stopped_lsn = _extract_latest_stop_lsn(out)
+    if stopped_lsn:
+        return lsn_ge(stopped_lsn, target_lsn)
+
+    # Fallback: if shutdown line exists alongside any recovery-stopping hint, accept.
+    if ("database system is shut down" in out) and ("recovery stopping" in out):
+        return True
+
+    return False
+
+
+_PGCD_MIN_REC_END_RE = re.compile(r"Minimum recovery ending location:\s+([0-9A-Fa-f]+/[0-9A-Fa-f]+)")
+
+def _min_recovery_end_lsn_from_controldata(inst: DrInstance, gp_home: str) -> Optional[str]:
+    """
+    Read 'Minimum recovery ending location' from pg_controldata for a DOWN instance.
+    This is the most reliable signal when logs are rotated/missing.
+    """
+    pgcd = f"{gp_home}/bin/pg_controldata"
+    cmd = f"{pgcd} {sh_quote(inst.data_dir)}"
+
+    # IMPORTANT: use gpssh for remote if you want; ssh is fine too.
+    # Because you already use gpssh_bash elsewhere, stay consistent:
+    out = run(["bash", "-lc", cmd], check=False) if inst.is_local else gpssh_bash(inst.host, cmd, check=False)
+    if not out:
+        return None
+
+    m = _PGCD_MIN_REC_END_RE.search(out)
+    return m.group(1).strip() if m else None
+
+
+def _down_and_reached_target_via_controldata(inst: DrInstance, gp_home: str, target_lsn: str) -> Tuple[bool, str]:
+    """
+    Returns (ok, reason). ok=True if pg_controldata proves recovery progressed to >= target_lsn.
+    """
+    v = _min_recovery_end_lsn_from_controldata(inst, gp_home)
+    if not v:
+        return False, "pg_controldata missing/unreadable min_recovery_end_lsn"
+    if lsn_ge(v, target_lsn):
+        return True, f"min_recovery_end_lsn={v} >= target_lsn={target_lsn}"
+    return False, f"min_recovery_end_lsn={v} < target_lsn={target_lsn}"
+
+
+# =============================
 # Config edits
 # =============================
 def ensure_standby_signal(inst: DrInstance) -> None:
@@ -226,7 +304,7 @@ def get_floor_lsn_sql(inst: DrInstance, user: str, db: str) -> Optional[str]:
 def get_floor_lsn_controldata(inst: DrInstance, gp_home: str) -> Optional[str]:
     pgcd = f"{gp_home}/bin/pg_controldata"
     cmd = f"{pgcd} {sh_quote(inst.data_dir)}"
-    out = run(["bash", "-lc", cmd], check=False) if inst.is_local else gpssh_bash(inst.host, cmd, check=False)
+    out = run(["bash", "-lc", cmd], check=False) if inst.is_local else ssh_bash(inst.host, cmd, check=False)
     if not out:
         return None
     m = re.search(r"Minimum recovery ending location:\s+([0-9A-Fa-f]+/[0-9A-Fa-f]+)", out)
@@ -281,7 +359,9 @@ def load_all_ready_manifests(manifest_dir: Path) -> List[dict]:
     return out
 
 
-def pick_best_manifest(manifest_dir: Path, latest_path: Path, floors: Dict[int, str]) -> Tuple[Optional[dict], str, List[str]]:
+def pick_best_manifest(
+    manifest_dir: Path, latest_path: Path, floors: Dict[int, str]
+) -> Tuple[Optional[dict], str, List[str]]:
     diags: List[str] = []
     latest = None
     if latest_path.exists():
@@ -413,33 +493,42 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
 
             ok, inrec, err = try_sql(inst.host, inst.port, user, db, "SELECT pg_is_in_recovery();")
             if ok:
-                # Instance is UP
                 ok2, replay, _ = try_sql(inst.host, inst.port, user, db, "SELECT pg_last_wal_replay_lsn();")
                 replay_s = (replay or "").strip() if ok2 else "?"
                 reached = lsn_ge(replay_s, tgt_lsn) if replay_s != "?" else False
-                print(f"[DR][seg={seg_id}] UP; replay_lsn={replay_s} target_lsn={tgt_lsn} reached={reached} in_recovery={inrec}")
+                print(
+                    f"[DR][seg={seg_id}] UP; replay_lsn={replay_s} target_lsn={tgt_lsn} "
+                    f"reached={reached} in_recovery={inrec}"
+                )
                 all_done = False
                 continue
 
+            # DOWN/unreachable by SQL is expected final state. Prove stop via logs.
+
             # Instance is DOWN/unreachable by SQL (expected final state)
-            if _tail_stop_signature(inst, tgt_lsn):
-                print(f"[DR][seg={seg_id}] DOWN; stop signature confirmed at/after target_lsn={tgt_lsn}")
+            ok_ctl, why = _down_and_reached_target_via_controldata(inst, cfg.gp_home, tgt_lsn)
+            if ok_ctl:
+                print(f"[DR][seg={seg_id}] DOWN; controldata confirms target reached. {why}")
             else:
-                print(f"[DR][seg={seg_id}] DOWN; but no stop signature yet (or logs not readable). err={err or '-'}")
+                print(f"[DR][seg={seg_id}] DOWN; not yet confirmed via controldata. {why}. err={err or '-'}")
                 all_done = False
+
 
         if all_done:
             print(f"[DR] ✅ All instances confirmed stopped at/after target. Advancing state to {target_rp}.")
             set_current_restore_point(current_state_file, target_rp)
-            atomic_write_json(receipts_dir / f"{target_rp}.receipt.json", {
-                "current_restore_point": current_rp,
-                "target_restore_point": target_rp,
-                "checked_at_utc": utc_now_iso(),
-                "mode": "shutdown",
-                "status": "reached_then_shutdown",
-                "waited_secs": waited,
-                "target_lsns": {str(k): v for k, v in target_lsns.items()},
-            })
+            atomic_write_json(
+                receipts_dir / f"{target_rp}.receipt.json",
+                {
+                    "current_restore_point": current_rp,
+                    "target_restore_point": target_rp,
+                    "checked_at_utc": utc_now_iso(),
+                    "mode": "shutdown",
+                    "status": "reached_then_shutdown",
+                    "waited_secs": waited,
+                    "target_lsns": {str(k): v for k, v in target_lsns.items()},
+                },
+            )
             return 0
 
         time.sleep(cfg.consumer_reach_poll_secs)
