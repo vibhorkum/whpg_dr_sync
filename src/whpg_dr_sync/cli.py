@@ -9,6 +9,19 @@ from .config import load_config
 from .service import status as pid_status, stop as pid_stop
 from .common import ShutdownRequested
 
+import signal
+
+def install_signal_handlers() -> None:
+    """
+    Make SIGTERM behave like Ctrl+C so systemd stop/shutdown exits cleanly
+    without tracebacks.
+    """
+    def _handler(signum, frame):
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _handler)
+    signal.signal(signal.SIGINT, _handler)
+
 
 def _tail_file(path: Path, n: int = 50) -> None:
     if not path.exists():
