@@ -1,7 +1,3 @@
-Here’s that text cleanly formatted as a proper **README.md** and **LICENSE** file in Markdown code blocks so you can drop them directly into your repository.  
-
-***
-
 
 # whpg_dr_sync
 
