@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import time
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +12,8 @@ from typing import Any, Dict, List
 
 from .common import atomic_write_json, psql, psql_util, ssh_test_file, utc_now_iso
 from .config import Config
-
+from .service import write_pid, remove_pid
+from .common import check_stop, ShutdownRequested
 
 @dataclass(frozen=True)
 class PrimaryConn:
@@ -257,6 +259,8 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
 
 
 def run_daemon(cfg: Config, once_no_gp_switch_wal: bool = False) -> int:
+    pid = os.getpid()
+    write_pid(cfg, "primary", pid)
     try:
         while True:
             try:
@@ -267,3 +271,5 @@ def run_daemon(cfg: Config, once_no_gp_switch_wal: bool = False) -> int:
     except KeyboardInterrupt:
         print("\n[PRIMARY] stop requested (Ctrl+C). Exiting cleanly.")
         return 130
+    finally:
+        remove_pid(cfg, "primary", pid)

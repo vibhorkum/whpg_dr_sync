@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .common import ShutdownRequested, atomic_write_json, check_stop, run, utc_now_iso
 from .config import Config
-
+from .service import write_pid, remove_pid
 
 # =============================
 # Shell helpers
@@ -354,6 +354,8 @@ def run_once(cfg: Config, target: str = "LATEST") -> int:
 
 
 def run_daemon(cfg: Config, target: str = "LATEST") -> int:
+    pid = os.getpid()
+    write_pid(cfg, "primary", pid)
     try:
         while True:
             try:
@@ -376,3 +378,5 @@ def run_daemon(cfg: Config, target: str = "LATEST") -> int:
     except KeyboardInterrupt:
         print("[stop] keyboard_interrupt")
         return 0
+    finally:
+        remove_pid(cfg, "primary", pid)
