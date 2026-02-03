@@ -1,21 +1,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .common import (
-    ShutdownRequested,
-    atomic_write_json,
-    check_stop,
-    psql,
-    psql_util,
-    ssh_test_file,
-    utc_now_iso,
-)
+from .common import atomic_write_json, psql, psql_util, ssh_test_file, utc_now_iso
 from .config import Config
 
 
@@ -28,16 +21,12 @@ class PrimaryConn:
 
 
 def gp_switch_wal(primary: PrimaryConn) -> List[Dict[str, Any]]:
-    """
-    Force WAL switch on coordinator + all segments.
-    Returns evidence rows (gp_segment_id, switch_lsn, switch_wal_file).
-    """
-    sql_txt = """
+    sql = """
     SELECT gp_segment_id, pg_switch_wal, pg_walfile_name
       FROM gp_switch_wal()
      ORDER BY gp_segment_id;
     """
-    out = psql(primary.host, primary.port, primary.user, primary.db, sql_txt)
+    out = psql(primary.host, primary.port, primary.user, primary.db, sql)
     rows: List[Dict[str, Any]] = []
     for line in out.splitlines():
         if not line.strip():
@@ -54,11 +43,7 @@ def gp_switch_wal(primary: PrimaryConn) -> List[Dict[str, Any]]:
 
 
 def create_restore_point_with_hosts(primary: PrimaryConn, restore_name: str) -> List[Dict[str, Any]]:
-    """
-    Create restore point and map each gp_segment_id(content) to its primary host/port
-    using gp_segment_configuration. role='p' ensures primary instance mapping.
-    """
-    sql_txt = f"""
+    sql = f"""
     SELECT rp.gp_segment_id,
            rp.restore_lsn,
            sc.dbid,
@@ -70,7 +55,7 @@ def create_restore_point_with_hosts(primary: PrimaryConn, restore_name: str) -> 
      WHERE sc.role = 'p'
      ORDER BY rp.gp_segment_id, sc.dbid;
     """
-    out = psql(primary.host, primary.port, primary.user, primary.db, sql_txt)
+    out = psql(primary.host, primary.port, primary.user, primary.db, sql)
     rows: List[Dict[str, Any]] = []
     for line in out.splitlines():
         if not line.strip():
@@ -91,28 +76,16 @@ def create_restore_point_with_hosts(primary: PrimaryConn, restore_name: str) -> 
 
 
 def wal_file_for_lsn_on_instance(
-    primary: PrimaryConn,
-    seg_id: int,
-    seg_host: str,
-    seg_port: int,
-    lsn: str,
+    primary: PrimaryConn, seg_id: int, seg_host: str, seg_port: int, lsn: str
 ) -> str:
-    """
-    LSN->WAL filename must be computed on the owning instance.
-      - coordinator (-1): run on coordinator
-      - segment (>=0): run on that segment instance (utility mode)
-    """
-    sql_txt = f"SELECT pg_walfile_name('{lsn}');"
+    sql = f"SELECT pg_walfile_name('{lsn}');"
     if seg_id == -1:
-        return psql(primary.host, primary.port, primary.user, primary.db, sql_txt).strip()
-    return psql_util(seg_host, seg_port, primary.user, primary.db, sql_txt).strip()
+        return psql(primary.host, primary.port, primary.user, primary.db, sql).strip()
+    return psql_util(seg_host, seg_port, primary.user, primary.db, sql).strip()
 
 
 def archiver_stats_cluster(primary: PrimaryConn) -> Dict[str, Any]:
-    """
-    Cluster-wide archiver stats: coordinator + all segments.
-    """
-    sql_txt = r"""
+    sql = r"""
     SELECT COALESCE(
       json_agg(
         json_build_object(
@@ -156,7 +129,7 @@ def archiver_stats_cluster(primary: PrimaryConn) -> Dict[str, Any]:
       JOIN gp_dist_random('gp_id') AS s ON true
     ) foo;
     """
-    raw = psql(primary.host, primary.port, primary.user, primary.db, sql_txt).strip()
+    raw = psql(primary.host, primary.port, primary.user, primary.db, sql).strip()
     rows = json.loads(raw) if raw else []
     any_failed_time = any(bool(r.get("last_failed_time")) for r in rows)
     return {
@@ -167,20 +140,12 @@ def archiver_stats_cluster(primary: PrimaryConn) -> Dict[str, Any]:
 
 
 def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
-    """
-    Run a single publisher cycle:
-      - gp_create_restore_point()
-      - compute per-segment WAL file names (on owning instances)
-      - optional gp_switch_wal()
-      - write pending manifest (ready=False)
-      - wait bounded for wal files to appear in archive sources
-      - update manifest (ready=True/False) + update LATEST.json
-    """
-    check_stop()
-
     primary = PrimaryConn(cfg.primary_host, cfg.primary_port, cfg.primary_user, cfg.primary_db)
+
     manifest_dir = Path(cfg.manifest_dir)
     latest_path = Path(cfg.latest_path)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
 
     ts = utc_now_iso()
     restore_name = "sync_point_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -193,13 +158,12 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
 
     targets: List[Dict[str, Any]] = []
     for r in rp_rows:
-        check_stop()
         seg_id = int(r["gp_segment_id"])
-        lsn = str(r["restore_lsn"]).strip()
-        src_host = str(r["primary_host"]).strip()
+        lsn = r["restore_lsn"]
+        src_host = r["primary_host"]
         src_port = int(r["primary_port"])
-        wal_file = wal_file_for_lsn_on_instance(primary, seg_id, src_host, src_port, lsn)
 
+        wal_file = wal_file_for_lsn_on_instance(primary, seg_id, src_host, src_port, lsn)
         targets.append(
             {
                 "gp_segment_id": seg_id,
@@ -208,6 +172,7 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
                 "archive_dir": cfg.archive_dir,
                 "wal_file": wal_file,
                 "wal_present": False,
+                "primary_port": src_port,
             }
         )
 
@@ -246,11 +211,8 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
     ready = False
 
     while waited <= cfg.archive_wait_max_secs:
-        check_stop()
         all_present = True
-
         for t in targets:
-            check_stop()
             remote_path = f"{t['archive_dir']}/{t['wal_file']}"
             present = ssh_test_file(t["archive_source_host"], remote_path)
             t["wal_present"] = present
@@ -274,12 +236,21 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
 
     for t in targets:
         print(
-            "  seg={} lsn={} src={} wal={} present={}".format(
-                t["gp_segment_id"],
-                t["restore_lsn"],
-                t["archive_source_host"],
-                t["wal_file"],
-                t["wal_present"],
-            )
+            f"  seg={t['gp_segment_id']} lsn={t['restore_lsn']} "
+            f"src={t['archive_source_host']}:{t.get('primary_port','?')} "
+            f"wal={t['wal_file']} present={t['wal_present']}"
         )
     print(f"[PRIMARY] Updated {out_path} (ready={ready}) waited_secs={waited}")
+
+
+def run_daemon(cfg: Config, once_no_gp_switch_wal: bool = False) -> int:
+    try:
+        while True:
+            try:
+                publish_one(cfg, once_no_gp_switch_wal=once_no_gp_switch_wal)
+            except Exception as e:
+                print(f"[PRIMARY] ERROR: {e}", file=sys.stderr)
+            time.sleep(cfg.publisher_sleep_secs)
+    except KeyboardInterrupt:
+        print("\n[PRIMARY] stop requested (Ctrl+C). Exiting cleanly.")
+        return 130

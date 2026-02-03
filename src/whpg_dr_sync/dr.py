@@ -10,13 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .common import (
-    ShutdownRequested,
-    atomic_write_json,
-    check_stop,
-    run,
-    utc_now_iso,
-)
+from .common import atomic_write_json, run, utc_now_iso
 from .config import Config
 
 
@@ -28,23 +22,15 @@ def sh_quote(s: str) -> str:
 
 
 def gpssh_bash(host: str, script: str, check: bool = True) -> str:
-    # no -q; some environments don’t support it
     cmd = f"bash --noprofile --norc -lc {sh_quote(script)}"
     return run(["gpssh", "-h", host, "-e", cmd], check=check)
 
 
 def rewrite_conf_kv(conf_path: str, key: str, value_line: str) -> str:
-    """
-    Atomic config rewrite (no sed portability issues):
-      - remove any lines matching '^key[[:space:]]*='
-      - append value_line
-      - write to tmp then mv
-    """
     k = sh_quote(key)
     v = sh_quote(value_line)
     c = sh_quote(conf_path)
     tmp = sh_quote(conf_path + ".tmp")
-
     return (
         f"set -euo pipefail; "
         f"conf={c}; tmp={tmp}; "
@@ -136,7 +122,7 @@ def load_instances(cfg: Config) -> Dict[int, DrInstance]:
 
 
 # =============================
-# Config edits (NO sed)
+# Config edits
 # =============================
 def ensure_standby_signal(inst: DrInstance) -> None:
     sig = f"{inst.data_dir}/standby.signal"
@@ -205,9 +191,7 @@ def _pg_ctl_start(inst: DrInstance, gp_home: str) -> None:
 # =============================
 def get_floor_lsn_sql(inst: DrInstance, user: str, db: str) -> Optional[str]:
     ok, v, _ = try_sql(inst.host, inst.port, user, db, "SELECT min_recovery_end_lsn FROM pg_control_recovery();")
-    if ok and v:
-        return v.strip()
-    return None
+    return v.strip() if ok and v else None
 
 
 def get_floor_lsn_controldata(inst: DrInstance, gp_home: str) -> Optional[str]:
@@ -223,16 +207,14 @@ def get_floor_lsn_controldata(inst: DrInstance, gp_home: str) -> Optional[str]:
 def get_recovery_floors(instances: Dict[int, DrInstance], gp_home: str, user: str, db: str) -> Dict[int, str]:
     floors: Dict[int, str] = {}
     for seg_id, inst in instances.items():
-        v = get_floor_lsn_sql(inst, user, db)
-        if not v:
-            v = get_floor_lsn_controldata(inst, gp_home)
+        v = get_floor_lsn_sql(inst, user, db) or get_floor_lsn_controldata(inst, gp_home)
         if v:
             floors[seg_id] = v
     return floors
 
 
 # =============================
-# Manifest selection
+# Manifests
 # =============================
 def list_manifest_paths(manifest_dir: Path) -> List[Path]:
     return sorted(manifest_dir.glob("sync_point_*.json"))
@@ -270,14 +252,9 @@ def load_all_ready_manifests(manifest_dir: Path) -> List[dict]:
     return out
 
 
-def pick_best_manifest(
-    manifest_dir: Path,
-    latest_path: Path,
-    floors: Dict[int, str],
-) -> Tuple[Optional[dict], str, List[str]]:
+def pick_best_manifest(manifest_dir: Path, latest_path: Path, floors: Dict[int, str]) -> Tuple[Optional[dict], str, List[str]]:
     diags: List[str] = []
     latest = None
-
     if latest_path.exists():
         try:
             latest = json.loads(latest_path.read_text())
@@ -296,7 +273,7 @@ def pick_best_manifest(
     if not ready:
         return None, "no ready manifests exist", diags
 
-    for m in ready:  # earliest first
+    for m in ready:
         ok, _ = manifest_satisfies_floors(m, floors)
         if ok:
             return m, "selected earliest READY manifest at/after floors", diags
@@ -320,11 +297,9 @@ def set_current_restore_point(state_file: Path, rp: str) -> None:
 
 
 # =============================
-# Consumer cycle
+# Cycle
 # =============================
 def _cycle(cfg: Config, target: str = "LATEST") -> int:
-    check_stop()
-
     user = cfg.primary_user
     db = cfg.primary_db
 
@@ -347,7 +322,6 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     else:
         print("[DR] WARNING: Could not compute recovery floors.")
 
-    # Select target manifest
     if target != "LATEST":
         p = manifest_dir / f"{target}.json"
         if not p.exists():
@@ -382,10 +356,8 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
 
     target_lsns = {int(s["gp_segment_id"]): str(s["restore_lsn"]).strip() for s in target_manifest["segments"]}
 
-    # Apply
     print("[DR] Applying recovery_target_lsn (per instance) and recovery_target_action='shutdown' + start...")
     for seg_id, inst in instances.items():
-        check_stop()
         tgt_lsn = target_lsns.get(seg_id)
         if not tgt_lsn:
             raise RuntimeError(f"[DR][seg={seg_id}] target manifest missing restore_lsn")
@@ -394,23 +366,18 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
         ensure_standby_signal(inst)
         set_recovery_target_action_shutdown(inst)
         set_recovery_target_lsn(inst, tgt_lsn)
-
         _pg_ctl_stop(inst, cfg.gp_home)
         time.sleep(1)
         _pg_ctl_start(inst, cfg.gp_home)
 
-    # Wait for DOWN (shutdown target means "parked")
     print(
         f"[DR] Waiting for shutdown-at-target confirmation "
         f"(max_wait_secs={cfg.consumer_wait_reach_secs} poll_secs={cfg.consumer_reach_poll_secs})..."
     )
-
     waited = 0
     while waited <= cfg.consumer_wait_reach_secs:
-        check_stop()
-
         all_down = True
-        for seg_id, inst in instances.items():
+        for _, inst in instances.items():
             ok, _, _ = try_sql(inst.host, inst.port, user, db, "SELECT 1;")
             if ok:
                 all_down = False
@@ -451,15 +418,12 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     return 0
 
 
-# =============================
-# Public entrypoints for CLI
-# =============================
 def run_once(cfg: Config, target: str = "LATEST") -> int:
     try:
         return _cycle(cfg, target=target)
-    except ShutdownRequested as e:
-        print(f"[stop] {e.reason}")
-        return e.code
+    except KeyboardInterrupt:
+        print("\n[DR] stop requested (Ctrl+C). Exiting cleanly.")
+        return 130
     except Exception as e:
         print(f"[DR] ERROR: {e}", file=sys.stderr)
         return 2
@@ -468,8 +432,11 @@ def run_once(cfg: Config, target: str = "LATEST") -> int:
 def run_daemon(cfg: Config, target: str = "LATEST") -> int:
     try:
         while True:
-            _cycle(cfg, target=target)
+            try:
+                _cycle(cfg, target=target)
+            except Exception as e:
+                print(f"[DR] ERROR: {e}", file=sys.stderr)
             time.sleep(cfg.consumer_sleep_secs)
-    except ShutdownRequested as e:
-        print(f"[stop] {e.reason}")
-        return e.code
+    except KeyboardInterrupt:
+        print("\n[DR] stop requested (Ctrl+C). Exiting cleanly.")
+        return 130

@@ -32,6 +32,19 @@ def main() -> int:
     p_run = sp_primary.add_parser("run", help="Run publisher")
     p_run.add_argument("--once", action="store_true")
     p_run.add_argument("--no-gp-switch-wal", action="store_true")
+    # In PRIMARY subcommands, add:
+    sp_primary.add_parser("stop", help="Stop daemon (pidfile mode)")
+    sp_primary.add_parser("pid-status", help="Show pidfile status (pidfile mode)")
+
+    p_status = sp_primary.add_parser("status", help="Show PRIMARY state (LATEST manifest etc.)")
+    p_status.add_argument("--format", choices=["table", "prometheus", "json"], default="table")
+    p_status.add_argument("--include-history", action="store_true")
+    p_status.add_argument("--history-n", type=int, default=10)
+    p_status.add_argument("--name", default="whpg_dr_sync")
+
+    p_logs = sp_primary.add_parser("logs", help="Tail latest manifest/LATEST.json")
+    p_logs.add_argument("--n", type=int, default=50)
+
 
     # DR
     p_dr = sub.add_parser("dr", help="DR-side manifest consumer")
@@ -61,23 +74,43 @@ def main() -> int:
     if args.mode == "primary":
         from .primary import publish_one
 
-        if args.cmd == "run":
-            if args.once:
-                publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
-                return 0
+        if args.cmd == "stop":
+            pid_stop(cfg, "primary")
+            return 0
 
-            while True:
-                try:
+        if args.cmd == "pid-status":
+            pid_status(cfg, "primary")
+            return 0
+
+        if args.cmd == "status":
+            from .status import render_status
+            out = render_status(cfg, fmt=args.format, include_history=args.include_history,
+                        history_n=args.history_n, metric_name=args.name, mode="primary")
+            sys.stdout.write(out if out.endswith("\n") else out + "\n")
+            return 0
+
+        if args.cmd == "run":
+                from .primary import publish_one, run_daemon
+                if args.once:
                     publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
-                except Exception as e:
-                    print(f"[PRIMARY] ERROR: {e}", file=sys.stderr)
-                except ShutdownRequested as e:
-                    print(f"[stop] {e.reason}")
-                    return e.code
-                except KeyboardInterrupt:
-                    print("[stop] keyboard_interrupt")
                     return 0
-                time.sleep(cfg.publisher_sleep_secs)
+                return run_daemon(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
+            #if args.once:
+            #    publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
+            #    return 0
+
+            # while True:
+            #    try:
+            #        publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
+            #    except Exception as e:
+            #        print(f"[PRIMARY] ERROR: {e}", file=sys.stderr)
+            #    except ShutdownRequested as e:
+            #        print(f"[stop] {e.reason}")
+            #        return e.code
+            #    except KeyboardInterrupt:
+            #        print("[stop] keyboard_interrupt")
+            #        return 0
+            #    time.sleep(cfg.publisher_sleep_secs)
         return 0
 
     if args.mode == "dr":

@@ -57,6 +57,7 @@ def _table(rows: List[List[str]]) -> str:
 
 @dataclass
 class Snapshot:
+    mode: str  # "dr" or "primary"
     latest_restore_point: str
     latest_ready: Optional[bool]
     current_restore_point: str
@@ -82,7 +83,7 @@ def _load_latest(cfg) -> Tuple[str, Optional[bool], List[str]]:
     return rp, (ready if isinstance(ready, bool) else None), notes
 
 
-def _load_current(cfg) -> Tuple[str, List[str]]:
+def _load_current_dr(cfg) -> Tuple[str, List[str]]:
     notes: List[str] = []
     state_file = Path(cfg.state_dir) / "current_restore_point.txt"
     cur = _read_text(state_file) or "-"
@@ -137,22 +138,53 @@ def _load_last_receipt(cfg, target_rp: str, history_n: int) -> Tuple[str, str, s
     return last_file, status, checked, waited_i, hist, notes
 
 
-def collect(cfg, history_n: int = 10) -> Tuple[Snapshot, List[dict]]:
+def collect_dr(cfg, history_n: int = 10) -> Tuple[Snapshot, List[dict]]:
     notes: List[str] = []
 
     latest_rp, latest_ready, n1 = _load_latest(cfg)
     notes.extend(n1)
 
-    current_rp, n2 = _load_current(cfg)
+    current_rp, n2 = _load_current_dr(cfg)
     notes.extend(n2)
 
-    # simplest “target”: LATEST restore point
-    target_rp = latest_rp
+    target_rp = latest_rp  # DR wants to converge to LATEST by default
 
     last_file, last_status, last_checked, last_waited, hist, n3 = _load_last_receipt(cfg, target_rp, history_n)
     notes.extend(n3)
 
     snap = Snapshot(
+        mode="dr",
+        latest_restore_point=latest_rp,
+        latest_ready=latest_ready,
+        current_restore_point=current_rp,
+        target_restore_point=target_rp,
+        last_receipt_file=last_file,
+        last_receipt_status=last_status,
+        last_receipt_checked_at_utc=last_checked,
+        last_receipt_waited_secs=last_waited,
+        notes=notes,
+    )
+    return snap, hist
+
+
+def collect_primary(cfg, history_n: int = 10) -> Tuple[Snapshot, List[dict]]:
+    notes: List[str] = []
+
+    latest_rp, latest_ready, n1 = _load_latest(cfg)
+    notes.extend(n1)
+
+    # On PRIMARY there’s no "current_restore_point.txt" concept; make it explicit.
+    current_rp = "-"
+    target_rp = latest_rp  # “what am I publishing most recently?”
+
+    # Reuse receipts dir if you keep it shared; otherwise it will just say none.
+    last_file, last_status, last_checked, last_waited, hist, n3 = _load_last_receipt(cfg, target_rp, history_n)
+    # For primary it is normal to have no receipts; don’t treat as scary.
+    # Still include note for visibility.
+    notes.extend(n3)
+
+    snap = Snapshot(
+        mode="primary",
         latest_restore_point=latest_rp,
         latest_ready=latest_ready,
         current_restore_point=current_rp,
@@ -169,7 +201,6 @@ def collect(cfg, history_n: int = 10) -> Tuple[Snapshot, List[dict]]:
 def render_prometheus(s: Snapshot, history: List[dict], metric_name: str) -> str:
     name = (metric_name or "whpg_dr_sync").strip()
 
-    # status code
     ok_statuses = {
         "stopped_at_target_all",
         "reached_then_shutdown",
@@ -192,28 +223,28 @@ def render_prometheus(s: Snapshot, history: List[dict], metric_name: str) -> str
         latest_ready_val = 0
 
     drift = 0
-    if s.current_restore_point not in ("-", "") and s.target_restore_point not in ("-", ""):
-        drift = 1 if s.current_restore_point != s.target_restore_point else 0
+    if s.mode == "dr":
+        if s.current_restore_point not in ("-", "") and s.target_restore_point not in ("-", ""):
+            drift = 1 if s.current_restore_point != s.target_restore_point else 0
 
     lines: List[str] = []
     lines.append(f"# HELP {name}_status_code 1=ok,0=unknown,-1=bad")
     lines.append(f"# TYPE {name}_status_code gauge")
-    lines.append(f'{name}_status_code{{status="{s.last_receipt_status}"}} {code}')
+    lines.append(f'{name}_status_code{{mode="{s.mode}",status="{s.last_receipt_status}"}} {code}')
 
     lines.append(f"# HELP {name}_latest_ready Whether LATEST manifest is ready (1=true,0=false,-1=unknown)")
     lines.append(f"# TYPE {name}_latest_ready gauge")
-    lines.append(f"{name}_latest_ready {latest_ready_val}")
+    lines.append(f'{name}_latest_ready{{mode="{s.mode}"}} {latest_ready_val}')
 
-    lines.append(f"# HELP {name}_drift Whether current restore point differs from target (1=yes,0=no)")
+    lines.append(f"# HELP {name}_drift Whether current restore point differs from target (1=yes,0=no) (dr only)")
     lines.append(f"# TYPE {name}_drift gauge")
-    lines.append(f"{name}_drift {drift}")
+    lines.append(f'{name}_drift{{mode="{s.mode}"}} {drift}')
 
     if s.last_receipt_waited_secs is not None:
         lines.append(f"# HELP {name}_last_waited_seconds waited_secs from last receipt (if present)")
         lines.append(f"# TYPE {name}_last_waited_seconds gauge")
-        lines.append(f"{name}_last_waited_seconds {int(s.last_receipt_waited_secs)}")
+        lines.append(f'{name}_last_waited_seconds{{mode="{s.mode}"}} {int(s.last_receipt_waited_secs)}')
 
-    # simple history counters
     if history:
         ok = 0
         timeout = 0
@@ -229,9 +260,9 @@ def render_prometheus(s: Snapshot, history: List[dict], metric_name: str) -> str
 
         lines.append(f"# HELP {name}_receipts_recent_count Counts of recent receipt statuses")
         lines.append(f"# TYPE {name}_receipts_recent_count gauge")
-        lines.append(f'{name}_receipts_recent_count{{kind="ok"}} {ok}')
-        lines.append(f'{name}_receipts_recent_count{{kind="timeout"}} {timeout}')
-        lines.append(f'{name}_receipts_recent_count{{kind="other"}} {other}')
+        lines.append(f'{name}_receipts_recent_count{{mode="{s.mode}",kind="ok"}} {ok}')
+        lines.append(f'{name}_receipts_recent_count{{mode="{s.mode}",kind="timeout"}} {timeout}')
+        lines.append(f'{name}_receipts_recent_count{{mode="{s.mode}",kind="other"}} {other}')
 
     return "\n".join(lines) + "\n"
 
@@ -239,6 +270,7 @@ def render_prometheus(s: Snapshot, history: List[dict], metric_name: str) -> str
 def render_table(s: Snapshot, history: List[dict], include_history: bool) -> str:
     rows = [
         ["field", "value"],
+        ["mode", s.mode],
         ["latest.restore_point", s.latest_restore_point],
         ["latest.ready", "-" if s.latest_ready is None else ("true" if s.latest_ready else "false")],
         ["current.restore_point", s.current_restore_point],
@@ -260,13 +292,15 @@ def render_table(s: Snapshot, history: List[dict], include_history: bool) -> str
         else:
             hrows = [["checked_at_utc", "status", "current", "target", "file"]]
             for r in history:
-                hrows.append([
-                    _fmt_ts(r.get("checked_at_utc")),
-                    _safe_str(r.get("status"), "-"),
-                    _safe_str(r.get("current_restore_point"), "-"),
-                    _safe_str(r.get("target_restore_point"), "-"),
-                    _safe_str(r.get("_file"), "-"),
-                ])
+                hrows.append(
+                    [
+                        _fmt_ts(r.get("checked_at_utc")),
+                        _safe_str(r.get("status"), "-"),
+                        _safe_str(r.get("current_restore_point"), "-"),
+                        _safe_str(r.get("target_restore_point"), "-"),
+                        _safe_str(r.get("_file"), "-"),
+                    ]
+                )
             out += _table(hrows)
 
     return out + "\n"
@@ -274,6 +308,7 @@ def render_table(s: Snapshot, history: List[dict], include_history: bool) -> str
 
 def render_json(s: Snapshot, history: List[dict], include_history: bool) -> str:
     obj = {
+        "mode": s.mode,
         "latest": {"restore_point": s.latest_restore_point, "ready": s.latest_ready},
         "state": {"current_restore_point": s.current_restore_point, "target_restore_point": s.target_restore_point},
         "last_receipt": {
@@ -289,11 +324,21 @@ def render_json(s: Snapshot, history: List[dict], include_history: bool) -> str:
     return json.dumps(obj, indent=2) + "\n"
 
 
-def render_status(cfg, fmt: str = "table", include_history: bool = False, history_n: int = 10, metric_name: str = "whpg_dr_sync") -> str:
-    snap, hist = collect(cfg, history_n=history_n)
+def render_status(
+    cfg,
+    fmt: str = "table",
+    include_history: bool = False,
+    history_n: int = 10,
+    metric_name: str = "whpg_dr_sync",
+    mode: str = "dr",
+) -> str:
+    mode = (mode or "dr").strip().lower()
+    if mode == "primary":
+        snap, hist = collect_primary(cfg, history_n=history_n)
+    else:
+        snap, hist = collect_dr(cfg, history_n=history_n)
 
     if fmt == "prometheus":
-        # For Prometheus, history is useful; we always compute it anyway.
         return render_prometheus(snap, hist, metric_name=metric_name)
 
     if fmt == "json":
