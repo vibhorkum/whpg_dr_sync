@@ -318,3 +318,13 @@ This is **deterministic DR**, not magic.
 ## License
 
 Apache License 2.0 — see [LICENSE](https://www.google.com/search?q=LICENSE).
+
+## Author
+
+**Vibhor Kumar**
+
+Data Platform & PostgreSQL Leader  
+Open Source • Enterprise Postgres • AI-aware Data Platforms
+
+- GitHub: https://github.com/vibhorkum
+- LinkedIn: https://www.linkedin.com/in/vibhorkumar/
