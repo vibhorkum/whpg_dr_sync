@@ -74,7 +74,7 @@ def main() -> int:
                 except ShutdownRequested as e:
                     print(f"[stop] {e.reason}")
                     return e.code
-               except KeyboardInterrupt:
+                except KeyboardInterrupt:
                     print("[stop] keyboard_interrupt")
                     return 0
                 time.sleep(cfg.publisher_sleep_secs)
