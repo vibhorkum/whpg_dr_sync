@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .config import load_config
 from .service import status as pid_status, stop as pid_stop
-from .common import ShutdownRequested, install_signal_handlers
+from .common import ShutdownRequested
 
 
 def _tail_file(path: Path, n: int = 50) -> None:
