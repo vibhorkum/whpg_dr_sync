@@ -15,7 +15,30 @@ def _pidfile(cfg: Config, role: str) -> Path:
 
 
 def write_pid(cfg: Config, role: str, pid: int) -> None:
-    _pidfile(cfg, role).write_text(str(pid) + "\n")
+    """
+    Write pidfile, but refuse to overwrite an active daemon pid.
+    This prevents accidental double-start.
+    """
+    p = _pidfile(cfg, role)
+    old = read_pid(cfg, role)
+    if old and is_running(old):
+        raise RuntimeError(f"[{role}] already running (pid={old}) pidfile={p}")
+    p.write_text(str(pid) + "\n")
+
+
+def remove_pid(cfg: Config, role: str, pid: Optional[int] = None) -> None:
+    """
+    Remove pidfile if it belongs to 'pid' (if provided), else remove unconditionally.
+    """
+    p = _pidfile(cfg, role)
+    if not p.exists():
+        return
+    if pid is None:
+        p.unlink(missing_ok=True)
+        return
+    cur = read_pid(cfg, role)
+    if cur == pid:
+        p.unlink(missing_ok=True)
 
 
 def read_pid(cfg: Config, role: str) -> Optional[int]:
@@ -23,14 +46,22 @@ def read_pid(cfg: Config, role: str) -> Optional[int]:
     if not p.exists():
         return None
     try:
-        return int(p.read_text().strip())
+        s = p.read_text().strip()
+        return int(s) if s else None
     except Exception:
         return None
 
 
 def is_running(pid: int) -> bool:
+    """
+    True if process exists (even if permission denied).
+    """
     try:
         os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
         return True
     except Exception:
         return False
@@ -43,7 +74,7 @@ def stop(cfg: Config, role: str) -> None:
         return
     if not is_running(pid):
         print(f"[{role}] pid {pid} not running; cleaning pidfile")
-        _pidfile(cfg, role).unlink(missing_ok=True)
+        remove_pid(cfg, role)
         return
     os.kill(pid, signal.SIGTERM)
     print(f"[{role}] sent SIGTERM to pid={pid}")
