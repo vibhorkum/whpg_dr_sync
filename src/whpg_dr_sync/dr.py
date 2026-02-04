@@ -572,14 +572,38 @@ def _list_wal_files_between_lsns(start_lsn: str, end_lsn: str, timeline_id: int,
     return files
 
 
-def _check_wal_file_exists(archive_dir: str, wal_filename: str, host: str, is_local: bool) -> bool:
+def _check_wal_file_exists(archive_dir: str, wal_filename: str, host: str, is_local: bool, custom_cmd: str = "") -> bool:
     """
     Check if a WAL file exists in the archive directory (local or remote).
+    
+    Supports custom check commands for flexibility (e.g., S3, API, remote SSH).
+    Custom command template variables:
+    - {archive_dir}: Archive directory path
+    - {wal_filename}: WAL filename to check
+    - {host}: Host where check should run
+    
+    Custom command should output 'EXISTS' if file is present.
+    
+    Examples:
+    - SSH: "ssh {host} test -f {archive_dir}/{wal_filename} && echo EXISTS"
+    - S3: "aws s3 ls s3://bucket/{archive_dir}/{wal_filename} && echo EXISTS"
     """
     wal_path = f"{archive_dir}/{wal_filename}"
-    script = f"test -f {sh_quote(wal_path)} && echo 'EXISTS' || echo 'MISSING'"
     
-    out = run(["bash", "-lc", script], check=False) if is_local else ssh_bash(host, script, check=False)
+    if custom_cmd:
+        # Use custom command with template substitution
+        script = custom_cmd.format(
+            archive_dir=archive_dir,
+            wal_filename=wal_filename,
+            wal_path=wal_path,
+            host=host,
+        )
+        out = run(["bash", "-lc", script], check=False)
+    else:
+        # Default: simple file existence check
+        script = f"test -f {sh_quote(wal_path)} && echo 'EXISTS' || echo 'MISSING'"
+        out = run(["bash", "-lc", script], check=False) if is_local else ssh_bash(host, script, check=False)
+    
     return "EXISTS" in (out or "")
 
 
@@ -629,9 +653,10 @@ def _preflight_wal_check(
         # Check each WAL file
         missing = []
         archive_dir = cfg.archive_dir
+        custom_cmd = cfg.wal_check_command
         
         for wal_file in required_wals[:100]:  # Limit check to first 100 to avoid overwhelming
-            if not _check_wal_file_exists(archive_dir, wal_file, inst.host, inst.is_local):
+            if not _check_wal_file_exists(archive_dir, wal_file, inst.host, inst.is_local, custom_cmd):
                 missing.append(wal_file)
         
         if missing:

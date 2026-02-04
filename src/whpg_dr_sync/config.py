@@ -51,6 +51,7 @@ class Config:
     # wal
     wal_segment_size_mb: int
     wal_enumerate_hard_limit: int
+    wal_check_command: str  # Optional custom command to check WAL file existence
 
 
 def load_config(path: str) -> Config:
@@ -102,4 +103,5 @@ def load_config(path: str) -> Config:
 
         wal_segment_size_mb=geti("wal_segment_size_mb", 64),
         wal_enumerate_hard_limit=geti("wal_enumerate_hard_limit", 250000),
+        wal_check_command=beh.get("wal_check_command", ""),
     )
