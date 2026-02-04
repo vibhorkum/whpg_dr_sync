@@ -503,22 +503,33 @@ def _get_wal_segment_info(inst: DrInstance, gp_home: str) -> Tuple[int, int]:
 def _wal_filename_for_lsn(lsn: str, timeline_id: int, wal_seg_size: int) -> str:
     """
     Convert LSN to WAL filename given timeline and segment size.
-    Returns filename like "000000010000000900000065".
+    Returns filename like "000000010000003C0000002F".
+    
+    WAL filename format: TTTTTTTTXXXXXXXXYYYYYYYY where:
+    - T = timeline ID (8 hex digits)
+    - X = high 32 bits of LSN (log file ID) (8 hex digits)
+    - Y = (low 32 bits of LSN) / segment_size (segment number) (8 hex digits)
     """
     lsn_int = lsn_to_int(lsn)
-    seg_no = lsn_int // wal_seg_size
     
-    # WAL filename format: TTTTTTTTXXXXXXXXYYYYYYYY
-    # where T=timeline (8 hex), X=high 32 bits of seg_no, Y=low 32 bits
-    high = (seg_no >> 32) & 0xFFFFFFFF
-    low = seg_no & 0xFFFFFFFF
+    # Extract high and low 32 bits from LSN
+    xlogid = (lsn_int >> 32) & 0xFFFFFFFF  # High 32 bits (log file number)
+    xrecoff = lsn_int & 0xFFFFFFFF  # Low 32 bits (offset)
     
-    return f"{timeline_id:08X}{high:08X}{low:08X}"
+    # Calculate segment number within the log file
+    seg_no = xrecoff // wal_seg_size
+    
+    return f"{timeline_id:08X}{xlogid:08X}{seg_no:08X}"
 
 
 def _list_wal_files_between_lsns(start_lsn: str, end_lsn: str, timeline_id: int, wal_seg_size: int) -> List[str]:
     """
     List all WAL filenames needed between start_lsn (exclusive) and end_lsn (inclusive).
+    
+    WAL filename format: TTTTTTTTXXXXXXXXYYYYYYYY where:
+    - T = timeline ID (8 hex digits)
+    - X = high 32 bits of LSN (log file ID) (8 hex digits)  
+    - Y = (low 32 bits of LSN) / segment_size (segment number) (8 hex digits)
     """
     start_int = lsn_to_int(start_lsn)
     end_int = lsn_to_int(end_lsn)
@@ -526,15 +537,37 @@ def _list_wal_files_between_lsns(start_lsn: str, end_lsn: str, timeline_id: int,
     if start_int >= end_int:
         return []
     
-    start_seg = (start_int // wal_seg_size) + 1  # Next segment after start
-    end_seg = end_int // wal_seg_size
+    # Extract log file and segment for start LSN
+    start_xlogid = (start_int >> 32) & 0xFFFFFFFF
+    start_xrecoff = start_int & 0xFFFFFFFF
+    start_seg = start_xrecoff // wal_seg_size
+    
+    # Extract log file and segment for end LSN
+    end_xlogid = (end_int >> 32) & 0xFFFFFFFF
+    end_xrecoff = end_int & 0xFFFFFFFF
+    end_seg = end_xrecoff // wal_seg_size
     
     files = []
-    for seg_no in range(start_seg, end_seg + 1):
-        high = (seg_no >> 32) & 0xFFFFFFFF
-        low = seg_no & 0xFFFFFFFF
-        filename = f"{timeline_id:08X}{high:08X}{low:08X}"
+    
+    # Calculate max segments per log file (256 for 64MB segments in 16GB log files)
+    # In PostgreSQL, XLogSegmentsPerXLogId is typically 0x100 (256)
+    segs_per_xlogid = 0x100000000 // wal_seg_size
+    
+    # Iterate through all log files and segments
+    current_xlogid = start_xlogid
+    current_seg = start_seg + 1  # Start from next segment after start_lsn
+    
+    while (current_xlogid < end_xlogid) or (current_xlogid == end_xlogid and current_seg <= end_seg):
+        filename = f"{timeline_id:08X}{current_xlogid:08X}{current_seg:08X}"
         files.append(filename)
+        
+        # Move to next segment
+        current_seg += 1
+        
+        # If we've reached the max segments per log file, move to next log file
+        if current_seg >= segs_per_xlogid:
+            current_seg = 0
+            current_xlogid += 1
     
     return files
 
