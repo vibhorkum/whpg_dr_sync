@@ -29,6 +29,8 @@ class Config:
     # storage
     manifest_dir: str
     latest_path: str
+    manifest_fetch_command: str  # Optional custom command to fetch manifest files remotely
+    manifest_list_command: str  # Optional custom command to list manifest files remotely
 
     # archive (publisher uses this)
     archive_dir: str
@@ -98,6 +100,8 @@ def load_config(path: str) -> Config:
 
         manifest_dir=raw["storage"]["manifest_dir"],
         latest_path=raw["storage"]["latest_path"],
+        manifest_fetch_command=raw["storage"].get("manifest_fetch_command", ""),
+        manifest_list_command=raw["storage"].get("manifest_list_command", ""),
 
         archive_dir=raw["archive"]["archive_dir"],
 

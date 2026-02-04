@@ -396,6 +396,112 @@ def _pg_ctl_start(inst: DrInstance, gp_home: str) -> None:
 # =============================
 # Manifest selection (keep it simple + stable)
 # =============================
+def _list_manifest_files(cfg: Config) -> List[str]:
+    """
+    List manifest files from local or remote location.
+    
+    Supports custom list commands for remote access (e.g., S3, SSH).
+    Template variables:
+    - {manifest_dir}: Manifest directory path
+    
+    Examples:
+    - S3: "aws s3 ls s3://bucket{manifest_dir}/ | awk '{print $4}'"
+    - SSH: "ssh remote-host ls {manifest_dir}/"
+    
+    Returns:
+        List of manifest filenames (not full paths)
+    """
+    from pathlib import Path
+    
+    if cfg.manifest_list_command:
+        # Use custom list command
+        script = cfg.manifest_list_command.format(
+            manifest_dir=cfg.manifest_dir,
+        )
+        
+        try:
+            result = run(["bash", "-c", script], check=False)
+            if result and result.strip():
+                # Parse output - expect one filename per line
+                files = [line.strip() for line in result.strip().splitlines() if line.strip()]
+                return files
+            else:
+                print(f"[DR] Remote manifest list failed or returned empty")
+                return []
+        except Exception as e:
+            print(f"[DR] Error listing remote manifests: {e}")
+            return []
+    else:
+        # Default: local file access
+        manifest_dir = Path(cfg.manifest_dir)
+        if not manifest_dir.exists():
+            return []
+        try:
+            return [p.name for p in manifest_dir.glob("*.json")]
+        except Exception as e:
+            print(f"[DR] Error listing local manifests: {e}")
+            return []
+
+
+def _fetch_manifest_content(cfg: Config, manifest_path: str) -> Optional[str]:
+    """
+    Fetch manifest content from local or remote location.
+    
+    Supports custom fetch commands for remote access (e.g., S3, SSH, HTTP).
+    Template variables:
+    - {manifest_path}: Full path to manifest file
+    - {manifest_dir}: Manifest directory path
+    - {manifest_file}: Manifest filename only
+    
+    Custom command should output manifest JSON content to stdout.
+    
+    Examples:
+    - S3: "aws s3 cp s3://bucket{manifest_path} -"
+    - SSH: "ssh remote-host cat {manifest_path}"
+    - HTTP: "curl -f https://storage.example.com{manifest_path}"
+    
+    Args:
+        cfg: Configuration object
+        manifest_path: Path to manifest file (absolute or relative)
+    
+    Returns:
+        Manifest content as string, or None if fetch fails
+    """
+    from pathlib import Path
+    
+    if cfg.manifest_fetch_command:
+        # Use custom fetch command
+        p = Path(manifest_path)
+        manifest_file = p.name
+        
+        script = cfg.manifest_fetch_command.format(
+            manifest_path=manifest_path,
+            manifest_dir=cfg.manifest_dir,
+            manifest_file=manifest_file,
+        )
+        
+        try:
+            result = run(["bash", "-c", script], check=False)
+            if result and result.strip():
+                return result
+            else:
+                print(f"[DR] Remote manifest fetch failed or returned empty: {manifest_path}")
+                return None
+        except Exception as e:
+            print(f"[DR] Error fetching remote manifest {manifest_path}: {e}")
+            return None
+    else:
+        # Default: local file access
+        p = Path(manifest_path)
+        if not p.exists():
+            return None
+        try:
+            return p.read_text()
+        except Exception as e:
+            print(f"[DR] Error reading local manifest {manifest_path}: {e}")
+            return None
+
+
 def _manifest_ready(m: dict) -> bool:
     return bool(m.get("ready", False)) and bool(m.get("restore_point")) and bool(m.get("segments"))
 
@@ -404,29 +510,43 @@ def _load_target_manifest(cfg: Config, target: str) -> Optional[dict]:
     """
     Load target manifest. If target is "LATEST", always use LATEST.json when ready.
     Do not fall back to older manifests if LATEST exists but is not ready.
+    
+    Supports both local and remote manifest access via manifest_fetch_command.
     """
-    manifest_dir = Path(cfg.manifest_dir)
-    latest_path = Path(cfg.latest_path)
+    manifest_dir = cfg.manifest_dir
+    latest_path = cfg.latest_path
 
     if target != "LATEST":
         # Specific target requested
-        p = manifest_dir / f"{target}.json"
-        if not p.exists():
-            print(f"[DR] ERROR: manifest not found: {p}")
+        manifest_path = f"{manifest_dir}/{target}.json" if not manifest_dir.endswith('/') else f"{manifest_dir}{target}.json"
+        
+        content = _fetch_manifest_content(cfg, manifest_path)
+        if not content:
+            print(f"[DR] ERROR: manifest not found: {manifest_path}")
             return None
-        m = json.loads(p.read_text())
-        return m if _manifest_ready(m) else None
+        
+        try:
+            m = json.loads(content)
+            return m if _manifest_ready(m) else None
+        except json.JSONDecodeError as e:
+            print(f"[DR] ERROR: invalid JSON in manifest {manifest_path}: {e}")
+            return None
 
     # target == "LATEST": always use LATEST.json, do not fall back
-    if not latest_path.exists():
+    content = _fetch_manifest_content(cfg, latest_path)
+    if not content:
         print("[DR] No LATEST manifest exists.")
         return None
 
-    m = json.loads(latest_path.read_text())
-    if not _manifest_ready(m):
-        print("[DR] LATEST manifest not ready/valid yet. Will not use older manifests.")
+    try:
+        m = json.loads(content)
+        if not _manifest_ready(m):
+            print("[DR] LATEST manifest not ready/valid yet. Will not use older manifests.")
+            return None
+        return m
+    except json.JSONDecodeError as e:
+        print(f"[DR] ERROR: invalid JSON in LATEST manifest: {e}")
         return None
-    return m
 
 
 # =============================
