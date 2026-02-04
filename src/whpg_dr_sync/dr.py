@@ -572,6 +572,30 @@ def _list_wal_files_between_lsns(start_lsn: str, end_lsn: str, timeline_id: int,
     return files
 
 
+def _get_wal_check_command(cfg: Config, segment_id: int) -> str:
+    """
+    Get the appropriate WAL check command for a specific segment.
+    
+    Priority:
+    1. Per-segment command from wal_check_commands dict
+    2. Global wal_check_command fallback
+    3. Empty string (use default check)
+    
+    Args:
+        cfg: Configuration object
+        segment_id: Segment ID (-1 for coordinator, >= 0 for segments)
+    
+    Returns:
+        WAL check command string for the segment
+    """
+    # Check if there's a segment-specific command
+    if segment_id in cfg.wal_check_commands:
+        return cfg.wal_check_commands[segment_id]
+    
+    # Fall back to global command
+    return cfg.wal_check_command
+
+
 def _check_wal_file_exists(archive_dir: str, wal_filename: str, host: str, is_local: bool, custom_cmd: str = "") -> bool:
     """
     Check if a WAL file exists in the archive directory (local or remote).
@@ -653,7 +677,8 @@ def _preflight_wal_check(
         # Check each WAL file
         missing = []
         archive_dir = cfg.archive_dir
-        custom_cmd = cfg.wal_check_command
+        # Get segment-specific or global WAL check command
+        custom_cmd = _get_wal_check_command(cfg, seg_id)
         
         for wal_file in required_wals[:100]:  # Limit check to first 100 to avoid overwhelming
             if not _check_wal_file_exists(archive_dir, wal_file, inst.host, inst.is_local, custom_cmd):

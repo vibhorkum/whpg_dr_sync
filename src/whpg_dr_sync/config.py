@@ -51,7 +51,8 @@ class Config:
     # wal
     wal_segment_size_mb: int
     wal_enumerate_hard_limit: int
-    wal_check_command: str  # Optional custom command to check WAL file existence
+    wal_check_command: str  # Optional custom command to check WAL file existence (global fallback)
+    wal_check_commands: Dict[int, str]  # Per-segment/coordinator custom commands (segment_id -> command)
 
 
 def load_config(path: str) -> Config:
@@ -73,6 +74,18 @@ def load_config(path: str) -> Config:
                 is_local=bool(it.get("is_local", False)),
             )
         )
+
+    # Parse wal_check_commands (per-segment configuration)
+    wal_check_commands_raw = beh.get("wal_check_commands", {})
+    wal_check_commands: Dict[int, str] = {}
+    if isinstance(wal_check_commands_raw, dict):
+        for seg_id_str, cmd in wal_check_commands_raw.items():
+            try:
+                seg_id = int(seg_id_str)
+                wal_check_commands[seg_id] = str(cmd)
+            except (ValueError, TypeError):
+                # Skip invalid entries
+                pass
 
     return Config(
         raw=raw,
@@ -104,4 +117,5 @@ def load_config(path: str) -> Config:
         wal_segment_size_mb=geti("wal_segment_size_mb", 64),
         wal_enumerate_hard_limit=geti("wal_enumerate_hard_limit", 250000),
         wal_check_command=beh.get("wal_check_command", ""),
+        wal_check_commands=wal_check_commands,
     )
