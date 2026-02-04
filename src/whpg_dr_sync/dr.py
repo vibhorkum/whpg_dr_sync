@@ -20,11 +20,28 @@ from .service import write_pid, remove_pid
 def sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
+def ssh_bash(host: str, script: str, check: bool = True) -> str:
+    # Use a non-interactive, non-login shell to keep output stable
+    cmd = f"bash --noprofile --norc -lc {sh_quote(script)}"
+    return run(["ssh", host, cmd], check=check)
 
 def gpssh_bash(host: str, script: str, check: bool = True) -> str:
     cmd = f"bash --noprofile --norc -lc {sh_quote(script)}"
     return run(["gpssh", "-h", host, "-e", cmd], check=check)
 
+def _preflight(inst: DrInstance, gp_home: str) -> None:
+    if inst.gp_segment_id == -1:
+        return
+    cmd = (
+        f"set -euo pipefail; "
+        f"test -f {sh_quote(gp_home)}/greenplum_path.sh; "
+        f"source {sh_quote(gp_home)}/greenplum_path.sh; "
+        f"which pg_ctl; "
+        f"test -d {sh_quote(inst.data_dir)}; "
+        f"echo OK host=$(hostname) datadir={sh_quote(inst.data_dir)}"
+    )
+    out = ssh_bash(inst.host, cmd, check=False)
+    print(f"[DR][seg={inst.gp_segment_id}] preflight: {out}")
 
 def rewrite_conf_kv(conf_path: str, key: str, value_line: str) -> str:
     k = sh_quote(key)
@@ -78,6 +95,47 @@ def try_sql(host: str, port: int, user: str, db: str, sql: str) -> Tuple[bool, O
 # =============================
 # LSN compare
 # =============================
+
+def _pg_controldata_min_recovery_end_lsn(inst: DrInstance, gp_home: str) -> Optional[str]:
+    """
+    Reads 'Minimum recovery ending location' from pg_controldata.
+    Works even when the postmaster is down.
+    """
+    pgcd = f"{gp_home}/bin/pg_controldata"
+    cmd = f"{pgcd} {sh_quote(inst.data_dir)}"
+    out = run(["bash", "-lc", cmd], check=False) if inst.is_local else gpssh_bash(inst.host, cmd, check=False)
+    if not out:
+        return None
+    m = re.search(r"Minimum recovery ending location:\s+([0-9A-Fa-f]+/[0-9A-Fa-f]+)", out)
+    return m.group(1).strip() if m else None
+
+def controldata_lsns(inst: DrInstance, gp_home: str) -> Dict[str, str]:
+    pgcd = f"{gp_home}/bin/pg_controldata"
+    cmd = f"{pgcd} {sh_quote(inst.data_dir)}"
+    out = run(["bash", "-lc", cmd], check=False) if inst.is_local else gpssh_bash(inst.host, cmd, check=False)
+    if not out:
+        return {}
+
+    fields = {
+        "min_recovery_end_lsn": r"Minimum recovery ending location:\s+([0-9A-Fa-f]+/[0-9A-Fa-f]+)",
+        "latest_checkpoint_lsn": r"Latest checkpoint location:\s+([0-9A-Fa-f]+/[0-9A-Fa-f]+)",
+        "latest_redo_lsn": r"Latest redo location:\s+([0-9A-Fa-f]+/[0-9A-Fa-f]+)",
+    }
+    res: Dict[str, str] = {}
+    for k, pat in fields.items():
+        m = re.search(pat, out)
+        if m:
+            res[k] = m.group(1).strip()
+    return res
+
+def controldata_reached_target(inst: DrInstance, gp_home: str, target_lsn: str) -> Tuple[bool, Dict[str, str]]:
+    lsns = controldata_lsns(inst, gp_home)
+    for _, v in lsns.items():
+        if lsn_ge(v, target_lsn):
+            return True, lsns
+    return False, lsns
+
+
 def lsn_to_int(lsn: str) -> int:
     s = (lsn or "").strip()
     if not s or s == "0/0":
@@ -124,6 +182,23 @@ def load_instances(cfg: Config) -> Dict[int, DrInstance]:
 # =============================
 # Config edits (NO sed)
 # =============================
+def clear_recovery_targets(inst: DrInstance) -> None:
+    check_stop()
+    conf = f"{inst.data_dir}/postgresql.conf"
+    keys = [
+        "recovery_target",
+        "recovery_target_name",
+        "recovery_target_lsn",
+        "recovery_target_time",
+        "recovery_target_xid",
+    ]
+    for k in keys:
+        script = rewrite_conf_kv(conf, k, f"# {k} = ''")
+        if inst.is_local:
+            run(["bash", "-lc", script], check=True)
+        else:
+            run(["ssh", inst.host, "bash", "--noprofile", "--norc", "-lc", script], check=True)
+
 def ensure_standby_signal(inst: DrInstance) -> None:
     check_stop()
     sig = f"{inst.data_dir}/standby.signal"
@@ -144,6 +219,16 @@ def set_recovery_target_action_shutdown(inst: DrInstance) -> None:
         gpssh_bash(inst.host, script, check=True)
 
 
+def set_recovery_target_name(inst: DrInstance, target_rp: str) -> None:
+    check_stop()
+    conf = f"{inst.data_dir}/postgresql.conf"
+    rp = (target_rp or "").strip().replace("\r", "")
+    script = rewrite_conf_kv(conf, "recovery_target_name", f"recovery_target_name = '{rp}'")
+    if inst.is_local:
+        run(["bash", "-lc", script], check=True)
+    else:
+        run(["ssh", inst.host, "bash", "--noprofile", "--norc", "-lc", script], check=True)
+
 def set_recovery_target_lsn(inst: DrInstance, target_lsn: str) -> None:
     check_stop()
     conf = f"{inst.data_dir}/postgresql.conf"
@@ -153,6 +238,124 @@ def set_recovery_target_lsn(inst: DrInstance, target_lsn: str) -> None:
         run(["bash", "-lc", script], check=True)
     else:
         gpssh_bash(inst.host, script, check=True)
+
+def _extract_first_csv_path(text: str) -> Optional[str]:
+    # gpssh output often includes: "[host] /path/to/gpdb-....csv"
+    m = re.search(r"(/[^ \n\t]+\.csv)\b", text or "")
+    return m.group(1) if m else None
+
+def newest_log_csv(inst: DrInstance) -> Optional[str]:
+    logdir = f"{inst.data_dir}/log"
+    script = (
+        "set -euo pipefail; "
+        f"ls -1t {sh_quote(logdir)}/*.csv 2>/dev/null | head -n 1 || true"
+    )
+
+    out = run(["bash", "-lc", script], check=False) if inst.is_local else ssh_bash(inst.host, script, check=False)
+    p = (out or "").strip()
+    return p or None
+
+#def newest_log_csv(inst: DrInstance) -> Optional[str]:
+#    """
+#    Return full path to newest gpdb CSV log file for an instance, or None.
+#    """
+#    logdir = f"{inst.data_dir}/log"
+#    script = (
+#        "set -euo pipefail; "
+#        f"f=$(ls -1t {sh_quote(logdir)}/*.csv 2>/dev/null | head -n 1 || true); "
+#        'if [ -z "$f" ]; then exit 0; fi; '
+#        'echo "$f"'
+#    )
+#    out = run(["bash", "-lc", script], check=False) if inst.is_local else gpssh_bash(inst.host, script, check=False)
+#    p = (out or "").strip()
+#    return p or None
+
+
+
+def tail_text_file(inst: DrInstance, path: str, n: int = 200) -> str:
+    """
+    Tail last N lines of a file (local or remote). Returns text (may be empty).
+    """
+    script = f"set -euo pipefail; test -f {sh_quote(path)} || exit 0; tail -n {int(n)} {sh_quote(path)}"
+    return run(["bash", "-lc", script], check=False) if inst.is_local else ssh_bash(inst.host, script, check=False)
+
+
+def parse_latest_recovery_stop_restore_point(log_text: str) -> Optional[str]:
+    """
+    Parse the most recent restore point name from lines like:
+      recovery stopping at restore point "sync_point_20260201_183847", time ...
+
+    Returns restore_point string or None.
+    """
+    if not log_text:
+        return None
+
+    # We want the *latest* occurrence in the tailed chunk.
+    rp: Optional[str] = None
+
+    for line in log_text.splitlines():
+        if "recovery stopping at restore point" not in line:
+            continue
+
+        # Works for CSV log lines too (quoted fields)
+        # Example snippet:
+        # ...,"LOG","00000","recovery stopping at restore point ""sync_point_..."" ...
+        m = re.search(r'recovery stopping at restore point\s+""?([^",]+)""?', line)
+        if m:
+            rp = m.group(1).strip()
+
+    return rp
+
+def recent_log_csv(inst: DrInstance, k: int = 5) -> List[str]:
+    """
+    Return full paths to the newest K gpdb CSV log files for an instance.
+    Newest first. May be empty.
+    """
+    logdir = f"{inst.data_dir}/log"
+    script = (
+        "set -euo pipefail; "
+        f"ls -1t {sh_quote(logdir)}/*.csv 2>/dev/null | head -n {int(k)} || true"
+    )
+    out = run(["bash", "-lc", script], check=False) if inst.is_local else ssh_bash(inst.host, script, check=False)
+    return [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+
+
+def last_stopped_restore_point_scan(
+    inst: DrInstance,
+    k_files: int = 5,
+    tail_n: int = 1500,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Scan newest K CSV log files and return the most recent 'recovery stopping at restore point' seen.
+    Returns (restore_point, logfile_path_where_found_or_newest_checked).
+    """
+    files = recent_log_csv(inst, k=k_files)
+    if not files:
+        return None, None
+
+    for f in files:
+        txt = tail_text_file(inst, f, n=tail_n)
+        rp = parse_latest_recovery_stop_restore_point(txt)
+        if rp:
+            return rp, f
+
+    return None, files[0]
+
+def last_stopped_restore_point(inst: DrInstance, n: int = 300) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (restore_point, logfile_path).
+    If not found, returns (None, logfile_path or None).
+    """
+    f = newest_log_csv(inst)
+    if not f or not f.endswith(".csv") or "bash --noprofile" in f:
+        print(f"[DR][seg={inst.gp_segment_id}] LOG invalid logfile path: {f!r}")
+        return None, None
+    #if not f:
+    #    return None, None
+
+    txt = tail_text_file(inst, f, n=n)
+    rp = parse_latest_recovery_stop_restore_point(txt)
+    return rp, f
 
 
 # =============================
@@ -174,17 +377,18 @@ def _pg_ctl_stop(inst: DrInstance, gp_home: str) -> None:
 
 def _pg_ctl_start(inst: DrInstance, gp_home: str) -> None:
     check_stop()
+    logfile = f"{inst.data_dir}/start.log"
     if inst.gp_segment_id == -1:
         cmd = (
             f"source {gp_home}/greenplum_path.sh && "
             f"export COORDINATOR_DATA_DIRECTORY={inst.data_dir} && "
-            f"pg_ctl -D {inst.data_dir} -o \"-c gp_role=utility\" start"
+            f"pg_ctl -D {inst.data_dir} -o \"-c gp_role=utility\" -l {sh_quote(logfile)} start"
         )
         run(["bash", "-lc", cmd], check=False)
         return
     cmd = (
         f"source {gp_home}/greenplum_path.sh && "
-        f"pg_ctl -D {inst.data_dir} -o \"-c gp_role=utility -c port={inst.port}\" start -l start.log"
+        f"pg_ctl -D {inst.data_dir} -o \"-c gp_role=utility -c port={inst.port}\" start -l {sh_quote(logfile)}"
     )
     gpssh_bash(inst.host, cmd, check=False)
 
@@ -280,9 +484,12 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
         print(f"[DR][seg={seg_id}] apply target_lsn={tgt_lsn} and start")
         ensure_standby_signal(inst)
         set_recovery_target_action_shutdown(inst)
-        set_recovery_target_lsn(inst, tgt_lsn)
+        #set_recovery_target_lsn(inst, tgt_lsn)
+        clear_recovery_targets(inst)
+        set_recovery_target_name(inst, target_rp)
         _pg_ctl_stop(inst, cfg.gp_home)
         time.sleep(1)
+        _preflight(inst, cfg.gp_home)
         _pg_ctl_start(inst, cfg.gp_home)
 
     print(
@@ -295,12 +502,44 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
         check_stop()
         all_down = True
 
-        for _, inst in instances.items():
-            ok, _, _ = try_sql(inst.host, inst.port, user, db, "SELECT 1;")
-            if ok:
-                all_down = False
+        for seg_id, inst in instances.items():
+            tgt_lsn = target_lsns[seg_id]
+
+            rp, logfile = last_stopped_restore_point_scan(inst, k_files=5, tail_n=1500)
+            if rp:
+                print(f"[DR][seg={seg_id}] LOG stop_restore_point={rp} file={logfile}")
+            else:
+                print(f"[DR][seg={seg_id}] LOG no stop signature found (tail) file={logfile or '-'}")
+
+            ok, replay, _ = try_sql(inst.host, inst.port, user, db, "SELECT pg_last_wal_replay_lsn();")
+            if ok and replay:
+                replay_s = replay.strip()
+                reached = lsn_ge(replay_s, tgt_lsn)
+                print(f"[DR][seg={seg_id}] UP replay_lsn={replay_s} target_lsn={tgt_lsn} reached={reached}")
+                if not reached:
+                    all_down = False
+                continue
+
+            # DOWN: confirm via pg_controldata
+            floor = _pg_controldata_min_recovery_end_lsn(inst, cfg.gp_home)
+            if floor and lsn_ge(floor, tgt_lsn):
+                print(f"[DR][seg={seg_id}] DOWN controldata_ok min_recovery_end_lsn={floor} >= target_lsn={tgt_lsn}")
+            else:
+                ok_cd, lsns = controldata_reached_target(inst, cfg.gp_home, tgt_lsn)
+                if ok_cd:
+                    print(f"[DR][seg={seg_id}] DOWN controldata_ok {lsns}")
+                else:
+                    print(f"[DR][seg={seg_id}] DOWN not_confirmed {lsns or 'no_controldata'} < target_lsn={tgt_lsn}")
+                    all_done = False
+
 
         if all_down:
+            rp, logfile = last_stopped_restore_point_scan(inst, k_files=5, tail_n=1500)
+            if rp:
+                print(f"[DR][seg={seg_id}] LOG stop_restore_point={rp} file={logfile}")
+            else:
+                print(f"[DR][seg={seg_id}] LOG no stop signature found (tail) file={logfile or '-'}")
+
             print("[DR] ✅ All instances appear DOWN (expected after shutdown target). Advancing state.")
             _set_current_restore_point(cfg, target_rp)
             atomic_write_json(
@@ -355,7 +594,7 @@ def run_once(cfg: Config, target: str = "LATEST") -> int:
 
 def run_daemon(cfg: Config, target: str = "LATEST") -> int:
     pid = os.getpid()
-    write_pid(cfg, "primary", pid)
+    write_pid(cfg, "dr", pid)
     try:
         while True:
             try:
@@ -379,4 +618,4 @@ def run_daemon(cfg: Config, target: str = "LATEST") -> int:
         print("[stop] keyboard_interrupt")
         return 0
     finally:
-        remove_pid(cfg, "primary", pid)
+        remove_pid(cfg, "dr", pid)
