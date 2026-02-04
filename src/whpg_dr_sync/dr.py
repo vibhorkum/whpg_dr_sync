@@ -781,7 +781,7 @@ def _preflight_wal_check(
     all_present = True
     
     # Parallelize WAL checks across instances
-    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(instances), 32)) as executor:
         futures = {}
         for seg_id, inst in instances.items():
             start_lsn = current_lsns.get(seg_id, "0/0")
@@ -1062,7 +1062,7 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     # Parallel Phase 1: Configure all instances
     # =============================
     print("[DR] Applying recovery_target_name and recovery_target_action='shutdown'...")
-    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(instances), 32)) as executor:
         futures = {}
         for seg_id, inst in instances.items():
             tgt_lsn = target_lsns.get(seg_id)
@@ -1091,7 +1091,7 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     # Parallel Phase 2: Stop, preflight, and start all instances
     # =============================
     print("[DR] Starting all instances in utility mode...")
-    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(instances), 32)) as executor:
         futures = {}
         for seg_id, inst in instances.items():
             future = executor.submit(
@@ -1125,7 +1125,7 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
         # =============================
         all_down = True
         
-        with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        with ThreadPoolExecutor(max_workers=min(len(instances), 32)) as executor:
             futures = {}
             for seg_id, inst in instances.items():
                 tgt_lsn = target_lsns[seg_id]
