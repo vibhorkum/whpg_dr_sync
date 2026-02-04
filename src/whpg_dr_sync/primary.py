@@ -14,6 +14,7 @@ from .common import atomic_write_json, psql, psql_util, ssh_test_file, utc_now_i
 from .config import Config
 from .service import write_pid, remove_pid
 from .common import check_stop, ShutdownRequested
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 @dataclass(frozen=True)
 class PrimaryConn:
@@ -146,6 +147,13 @@ def archiver_stats_cluster(primary: PrimaryConn) -> Dict[str, Any]:
     }
 
 
+def _check_target(t: Dict[str, Any]) -> bool:
+    remote_path = f"{t['archive_dir']}/{t['wal_file']}"
+    present = ssh_test_file(t["archive_source_host"], remote_path)
+    return bool(present)
+
+
+
 def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
     primary = PrimaryConn(cfg.primary_host, cfg.primary_port, cfg.primary_user, cfg.primary_db)
 
@@ -223,13 +231,25 @@ def publish_one(cfg: Config, once_no_gp_switch_wal: bool = False) -> None:
 
     try:
         while waited <= cfg.archive_wait_max_secs:
+            check_stop()
+
             all_present = True
-            for t in targets:
-                remote_path = f"{t['archive_dir']}/{t['wal_file']}"
-                present = ssh_test_file(t["archive_source_host"], remote_path)
-                t["wal_present"] = present
-                if not present:
-                    all_present = False
+            with ThreadPoolExecutor(max_workers=min(32, max(1, len(targets)))) as ex:
+                fut_map = {ex.submit(_check_target, t): t for t in targets}
+                for fut in as_completed(fut_map):
+                    t = fut_map[fut]
+                    present = fut.result()
+                    t["wal_present"] = present
+                    if not present:
+                        all_present = False
+
+            #all_present = True
+            #for t in targets:
+            #    remote_path = f"{t['archive_dir']}/{t['wal_file']}"
+            #    present = ssh_test_file(t["archive_source_host"], remote_path)
+            #    t["wal_present"] = present
+            #    if not present:
+            #        all_present = False
 
             if all_present:
                 ready = True

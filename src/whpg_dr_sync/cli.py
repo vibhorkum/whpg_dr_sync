@@ -108,7 +108,6 @@ def main() -> int:
                     publish_one(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
                     return 0
                 return run_daemon(cfg, once_no_gp_switch_wal=args.no_gp_switch_wal)
-
         if args.cmd == "logs":
             latest = Path(cfg.latest_path)
             manifest_dir = Path(cfg.manifest_dir)
