@@ -840,11 +840,11 @@ def _validate_recovery_points(
         if rp != target_rp:
             all_match = False
             if rp:
-                print(f"[DR][seg={seg_id}] ❌ Recovery point mismatch: expected={target_rp}, actual={rp}")
+                print(f"[DR][seg={seg_id}] [FAIL] Recovery point mismatch: expected={target_rp}, actual={rp}")
             else:
-                print(f"[DR][seg={seg_id}] ❌ No recovery point found in logs (expected={target_rp})")
+                print(f"[DR][seg={seg_id}] [FAIL] No recovery point found in logs (expected={target_rp})")
         else:
-            print(f"[DR][seg={seg_id}] ✅ Recovery point matches: {rp}")
+            print(f"[DR][seg={seg_id}] [OK] Recovery point matches: {rp}")
     
     return all_match, recovery_points
 
@@ -997,9 +997,9 @@ def wal_precheck_instance(
             missing.append(wal_file)
     
     if missing:
-        print(f"[DR]{label} ❌ Missing {len(missing)} WAL file(s), first few: {missing[:5]}")
+        print(f"[DR]{label} [FAIL] Missing {len(missing)} WAL file(s), first few: {missing[:5]}")
     else:
-        print(f"[DR]{label} ✅ All required WAL files present")
+        print(f"[DR]{label} [OK] All required WAL files present")
     
     return seg_id, missing
 
@@ -1044,7 +1044,7 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     wal_check_ok, missing_wals = _preflight_wal_check(cfg, instances, current_rp, target_rp, target_lsns)
     
     if not wal_check_ok:
-        print("[DR] ❌ Pre-flight FAILED: Missing WAL files detected. Will NOT start recovery.")
+        print("[DR] [FAIL] Pre-flight FAILED: Missing WAL files detected. Will NOT start recovery.")
         print("[DR] Missing WAL summary:")
         for seg_id, missing in missing_wals.items():
             print(f"  seg={seg_id}: {len(missing)} missing, first 5: {missing[:5]}")
@@ -1062,7 +1062,7 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
         )
         return 0
     
-    print("[DR] ✅ Pre-flight passed: All required WAL files are present")
+    print("[DR] [OK] Pre-flight passed: All required WAL files are present")
 
     # =============================
     # Parallel Phase 1: Configure all instances
@@ -1169,7 +1169,7 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
             rp_match, recovery_points = _validate_recovery_points(instances, target_rp)
             
             if rp_match:
-                print(f"[DR] ✅ SUCCESS: All segments stopped at restore point '{target_rp}'. Advancing state.")
+                print(f"[DR] [OK] SUCCESS: All segments stopped at restore point '{target_rp}'. Advancing state.")
                 _set_current_restore_point(cfg, target_rp)
                 atomic_write_json(
                     receipts_dir / f"{target_rp}.receipt.json",
