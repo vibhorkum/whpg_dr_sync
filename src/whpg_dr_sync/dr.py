@@ -1123,7 +1123,8 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
         # =============================
         # Parallel Phase 3: Check progress of all instances
         # =============================
-        all_down = True
+        all_reached_target = True
+        all_instances_down = True
         
         with ThreadPoolExecutor(max_workers=min(len(instances), 32)) as executor:
             futures = {}
@@ -1144,14 +1145,19 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
                 try:
                     reached_target, replay_lsn, recovery_point = future.result()
                     if not reached_target:
-                        all_down = False
+                        all_reached_target = False
+                    # If replay_lsn is not None, instance is UP (still recovering)
+                    if replay_lsn is not None:
+                        all_instances_down = False
                 except Exception as e:
                     seg_id = futures[future]
                     label = "[coord]" if seg_id == -1 else f"[seg={seg_id}]"
                     print(f"[DR]{label} Progress check failed: {e}")
                     raise
 
-        if all_down:
+        # Proceed to validation if all instances are DOWN, even if they didn't all reach target
+        # The validation will determine if they stopped at the correct restore point
+        if all_instances_down:
             # Validate recovery points from logs
             print("[DR] All instances DOWN. Validating recovery points from logs...")
             rp_match, recovery_points = _validate_recovery_points(instances, target_rp)
