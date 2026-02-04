@@ -30,6 +30,31 @@ No ambiguity. No "probably caught up." Either the system is parked at a known re
 
 ---
 
+## Key Features
+
+### Production-Grade Reliability
+
+* **Pre-flight WAL Availability Checks** - Verifies all required WAL files exist before starting recovery
+* **Recovery Point Validation** - Confirms instances stopped at correct restore point before advancing state
+* **Explicit State Tracking** - All actions recorded in receipts for post-mortem analysis
+* **Deterministic Shutdown** - Uses `recovery_target_action='shutdown'` for safe, repeatable recovery
+
+### Flexible Storage Integration
+
+* **Remote Manifest Access** - Retrieve manifests from S3, HTTP servers, or SSH-accessible remote hosts
+* **Per-Segment WAL Verification** - Different storage backends for coordinator and each segment
+* **Custom Commands** - Template-based commands for any storage system with CLI tools
+* **Multi-Region Support** - Works with centralized or replicated manifest storage
+
+### Configuration Options
+
+* **Template Variables** - Dynamic path substitution for manifest and WAL access
+* **Global and Per-Segment Settings** - Fine-grained control over WAL verification
+* **Backward Compatible** - All new features are optional, existing configs work unchanged
+
+---
+
+
 ## Architecture
 
 The system operates via a decoupled Publisher/Consumer model to ensure safety.
@@ -84,16 +109,20 @@ Everything is explicit. Everything is auditable.
 * Waits for archived WAL files to appear.
 * Publishes **READY / NOT READY** manifests.
 * Updates `LATEST.json`.
+* **Supports custom WAL verification commands** (per-segment or global).
 
 ### DR (Consumer)
 
 * Computes recovery floors (SQL + `pg_controldata`).
 * Selects the safest applicable manifest (LATEST or safe-forward).
+* **Supports remote manifest access** (S3, HTTP, SSH, or local filesystem).
 * Applies `recovery_target_lsn` per instance.
 * Ensures `standby.signal`.
 * Enforces `recovery_target_action='shutdown'`.
 * Confirms stop-at-target via evidence.
 * Advances state only when safe; writes receipts.
+* **Pre-flight WAL availability checks** with configurable verification.
+* **Recovery point validation** from logs before advancing state.
 
 ---
 
@@ -166,6 +195,133 @@ A single config file drives both roles.
 }
 
 ```
+
+### Configuration Fields
+
+**Primary Connection:**
+- `primary.host`, `primary.port`, `primary.db`, `primary.user` - Connection details for primary cluster
+
+**Storage:**
+- `storage.manifest_dir` - Directory for manifest files
+- `storage.latest_path` - Path to LATEST.json file
+- `storage.manifest_fetch_command` - (Optional) Custom command to fetch manifests from remote storage
+- `storage.manifest_list_command` - (Optional) Custom command to list manifest files
+
+**Archive:**
+- `archive.archive_dir` - Directory where WAL files are archived
+
+**DR:**
+- `dr.gp_home` - Greenplum installation directory
+- `dr.state_dir` - Directory for DR state files
+- `dr.receipts_dir` - Directory for receipt files
+- `dr.instances[]` - Array of DR instance configurations
+
+**Behavior:**
+- `behavior.publisher_sleep_secs` - Sleep interval for publisher daemon
+- `behavior.consumer_sleep_secs` - Sleep interval for DR consumer daemon
+- `behavior.consumer_reach_poll_secs` - Polling interval when waiting for target
+- `behavior.consumer_wait_reach_secs` - Maximum wait time for target
+- `behavior.wal_segment_size_mb` - WAL segment size (typically 64MB)
+- `behavior.wal_check_command` - (Optional) Global command to check WAL file existence
+- `behavior.wal_check_commands` - (Optional) Per-segment/coordinator WAL check commands
+
+---
+
+## Advanced Configuration
+
+### Remote Manifest Access
+
+Store and retrieve manifests from remote locations (S3, HTTP, SSH) instead of local filesystem.
+
+**Use Cases:**
+- Centralized manifest storage in S3 or cloud storage
+- Cross-network DR with manifests shared via HTTP/HTTPS
+- Multi-region DR with manifest replication
+
+**Configuration:**
+
+```json
+{
+  "storage": {
+    "manifest_dir": "/manifests",
+    "latest_path": "/manifests/LATEST.json",
+    "manifest_fetch_command": "aws s3 cp s3://my-bucket{manifest_path} -",
+    "manifest_list_command": "aws s3 ls s3://my-bucket{manifest_dir}/ | awk '{print $4}'"
+  }
+}
+```
+
+**Template Variables:**
+- `{manifest_path}` - Full path to manifest file
+- `{manifest_dir}` - Manifest directory path
+- `{manifest_file}` - Manifest filename only
+
+**Examples:**
+
+**AWS S3:**
+```json
+{
+  "storage": {
+    "manifest_fetch_command": "aws s3 cp s3://bucket{manifest_path} -",
+    "manifest_list_command": "aws s3 ls s3://bucket{manifest_dir}/ | awk '{print $4}'"
+  }
+}
+```
+
+**SSH/Remote Host:**
+```json
+{
+  "storage": {
+    "manifest_fetch_command": "ssh remote-host cat {manifest_path}",
+    "manifest_list_command": "ssh remote-host ls {manifest_dir}/"
+  }
+}
+```
+
+**HTTP/HTTPS:**
+```json
+{
+  "storage": {
+    "manifest_fetch_command": "curl -f https://storage.example.com{manifest_path}"
+  }
+}
+```
+
+### Per-Segment WAL Check Commands
+
+Configure different WAL verification methods for coordinator and individual segments.
+
+**Use Cases:**
+- Mixed storage backends (coordinator on local disk, segments on S3)
+- Different access methods per segment (SSH, S3, HTTP)
+- Segment-specific storage locations
+
+**Configuration:**
+
+```json
+{
+  "behavior": {
+    "wal_check_command": "ssh backup-server test -f /wal/{wal_filename} && echo EXISTS",
+    "wal_check_commands": {
+      "-1": "ssh coordinator-backup test -f /coord/{wal_filename} && echo EXISTS",
+      "0": "aws s3 ls s3://seg0-bucket/{wal_filename} && echo EXISTS",
+      "1": "curl -f https://api.storage.com/check?file={wal_filename} && echo EXISTS"
+    }
+  }
+}
+```
+
+**Template Variables:**
+- `{archive_dir}` - Archive directory path
+- `{wal_filename}` - WAL filename to check
+- `{wal_path}` - Full path (archive_dir/wal_filename)
+- `{host}` - Host where check should run
+
+**Behavior:**
+- Coordinator uses command for segment `-1`
+- Segment 0 uses command for segment `0`
+- Other segments fall back to global `wal_check_command`
+- If no custom command, uses local file check
 
 ---
 
