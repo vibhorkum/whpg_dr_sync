@@ -51,7 +51,7 @@ def rewrite_conf_kv(conf_path: str, key: str, value_line: str) -> str:
     return (
         f"set -euo pipefail; "
         f"conf={c}; tmp={tmp}; "
-        f"awk -v k={k} '!($0 ~ \"^\" k \"[[:space:]]*=\") {{print}}' \"$conf\" > \"$tmp\"; "
+        f"awk -v k={k} '!($0 ~ \"^[[:space:]]*#?[[:space:]]*\" k \"[[:space:]]*=\") {{print}}' \"$conf\" > \"$tmp\"; "
         f"printf '%s\\n' {v} >> \"$tmp\"; "
         f"mv -f \"$tmp\" \"$conf\""
     )
