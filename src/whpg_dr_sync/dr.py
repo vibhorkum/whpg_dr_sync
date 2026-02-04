@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -760,6 +761,7 @@ def _preflight_wal_check(
 ) -> Tuple[bool, Dict[int, List[str]]]:
     """
     Pre-flight check: verify all required WAL files exist before starting recovery.
+    Parallelized across all instances.
     
     Returns (all_present, missing_by_segment) where:
     - all_present: True if all WAL files are present
@@ -767,7 +769,7 @@ def _preflight_wal_check(
     """
     print("[DR] Pre-flight: checking WAL availability...")
     
-    # Get current state LSNs from pg_controldata
+    # Get current state LSNs from pg_controldata (still sequential for simplicity)
     current_lsns: Dict[int, str] = {}
     for seg_id, inst in instances.items():
         lsns = controldata_lsns(inst, cfg.gp_home)
@@ -778,38 +780,35 @@ def _preflight_wal_check(
     missing_by_segment: Dict[int, List[str]] = {}
     all_present = True
     
-    for seg_id, inst in instances.items():
-        start_lsn = current_lsns.get(seg_id, "0/0")
-        end_lsn = target_lsns.get(seg_id, "0/0")
+    # Parallelize WAL checks across instances
+    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        futures = {}
+        for seg_id, inst in instances.items():
+            start_lsn = current_lsns.get(seg_id, "0/0")
+            end_lsn = target_lsns.get(seg_id, "0/0")
+            
+            future = executor.submit(
+                wal_precheck_instance,
+                inst,
+                cfg.gp_home,
+                cfg,
+                start_lsn,
+                end_lsn,
+            )
+            futures[future] = seg_id
         
-        # Get WAL segment size and timeline
-        wal_seg_size, timeline_id = _get_wal_segment_info(inst, cfg.gp_home)
-        
-        # List required WAL files
-        required_wals = _list_wal_files_between_lsns(start_lsn, end_lsn, timeline_id, wal_seg_size)
-        
-        if not required_wals:
-            print(f"[DR][seg={seg_id}] No WAL files needed (current={start_lsn}, target={end_lsn})")
-            continue
-        
-        print(f"[DR][seg={seg_id}] Checking {len(required_wals)} WAL files (current={start_lsn}, target={end_lsn})")
-        
-        # Check each WAL file
-        missing = []
-        archive_dir = cfg.archive_dir
-        # Get segment-specific or global WAL check command
-        custom_cmd = _get_wal_check_command(cfg, seg_id)
-        
-        for wal_file in required_wals[:100]:  # Limit check to first 100 to avoid overwhelming
-            if not _check_wal_file_exists(archive_dir, wal_file, inst.host, inst.is_local, custom_cmd):
-                missing.append(wal_file)
-        
-        if missing:
-            missing_by_segment[seg_id] = missing
-            all_present = False
-            print(f"[DR][seg={seg_id}] ❌ Missing {len(missing)} WAL file(s), first few: {missing[:5]}")
-        else:
-            print(f"[DR][seg={seg_id}] ✅ All required WAL files present")
+        # Collect results - fail fast on exceptions
+        for future in as_completed(futures):
+            try:
+                seg_id, missing = future.result()
+                if missing:
+                    missing_by_segment[seg_id] = missing
+                    all_present = False
+            except Exception as e:
+                seg_id = futures[future]
+                label = "[coord]" if seg_id == -1 else f"[seg={seg_id}]"
+                print(f"[DR]{label} WAL check failed: {e}")
+                raise
     
     return all_present, missing_by_segment
 
@@ -843,6 +842,160 @@ def _validate_recovery_points(
     
     return all_match, recovery_points
 
+
+
+# =============================
+# Parallel execution helpers
+# =============================
+def _get_instance_label(inst: DrInstance) -> str:
+    """Return a label for logging: [coord] or [seg=N]"""
+    return "[coord]" if inst.gp_segment_id == -1 else f"[seg={inst.gp_segment_id}]"
+
+
+def configure_instance_recovery(
+    inst: DrInstance,
+    gp_home: str,
+    target_rp: str,
+) -> None:
+    """
+    Configure recovery target settings for a single instance.
+    Thread-safe: operates on distinct per-instance files.
+    """
+    check_stop()
+    label = _get_instance_label(inst)
+    print(f"[DR]{label} Configuring recovery target={target_rp}")
+    
+    ensure_standby_signal(inst)
+    set_recovery_target_action_shutdown(inst)
+    clear_recovery_targets(inst)
+    set_recovery_target_name(inst, target_rp)
+    
+    print(f"[DR]{label} Configuration complete")
+
+
+def start_instance(
+    inst: DrInstance,
+    gp_home: str,
+) -> None:
+    """
+    Stop, preflight check, and start a single instance.
+    Thread-safe: operates on distinct per-instance processes.
+    """
+    check_stop()
+    label = _get_instance_label(inst)
+    print(f"[DR]{label} Stopping instance")
+    
+    _pg_ctl_stop(inst, gp_home)
+    time.sleep(1)
+    
+    print(f"[DR]{label} Running preflight checks")
+    _preflight(inst, gp_home)
+    
+    print(f"[DR]{label} Starting instance in utility mode")
+    _pg_ctl_start(inst, gp_home)
+    print(f"[DR]{label} Start initiated")
+
+
+def check_instance_progress(
+    inst: DrInstance,
+    gp_home: str,
+    user: str,
+    db: str,
+    target_lsn: str,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Check if an instance has reached the target LSN and stopped.
+    
+    Returns (reached_target, replay_lsn, recovery_point) where:
+    - reached_target: True if instance confirmed at target (down or replay >= target)
+    - replay_lsn: pg_last_wal_replay_lsn if instance is UP, else None
+    - recovery_point: restore point found in logs if instance is DOWN, else None
+    
+    Thread-safe: only reads instance state, no shared mutation.
+    """
+    check_stop()
+    label = _get_instance_label(inst)
+    
+    # Check if instance is UP via SQL
+    ok, replay, _ = try_sql(inst.host, inst.port, user, db, "SELECT pg_last_wal_replay_lsn();")
+    if ok and replay:
+        replay_s = replay.strip()
+        reached = lsn_ge(replay_s, target_lsn)
+        print(f"[DR]{label} UP replay_lsn={replay_s} target_lsn={target_lsn} reached={reached}")
+        return reached, replay_s, None
+    
+    # Instance is DOWN - check via pg_controldata
+    floor = _pg_controldata_min_recovery_end_lsn(inst, gp_home)
+    if floor and lsn_ge(floor, target_lsn):
+        print(f"[DR]{label} DOWN controldata_ok min_recovery_end_lsn={floor} >= target_lsn={target_lsn}")
+        # Also get recovery point from logs
+        rp, logfile = last_stopped_restore_point_scan(inst, k_files=5, tail_n=1500)
+        if rp:
+            print(f"[DR]{label} LOG stop_restore_point={rp} file={logfile}")
+        else:
+            print(f"[DR]{label} LOG no stop signature found (tail) file={logfile or '-'}")
+        return True, None, rp
+    
+    # Check other LSNs from controldata
+    ok_cd, lsns = controldata_reached_target(inst, gp_home, target_lsn)
+    if ok_cd:
+        print(f"[DR]{label} DOWN controldata_ok {lsns}")
+        rp, logfile = last_stopped_restore_point_scan(inst, k_files=5, tail_n=1500)
+        if rp:
+            print(f"[DR]{label} LOG stop_restore_point={rp} file={logfile}")
+        return True, None, rp
+    
+    print(f"[DR]{label} DOWN not_confirmed {lsns or 'no_controldata'} < target_lsn={target_lsn}")
+    return False, None, None
+
+
+def wal_precheck_instance(
+    inst: DrInstance,
+    gp_home: str,
+    cfg: Config,
+    current_lsn: str,
+    target_lsn: str,
+) -> Tuple[int, List[str]]:
+    """
+    Check WAL availability for a single instance.
+    
+    Returns (seg_id, missing_wals) where:
+    - seg_id: instance gp_segment_id
+    - missing_wals: list of missing WAL filenames (empty if all present)
+    
+    Thread-safe: only reads archive state, no shared mutation.
+    """
+    check_stop()
+    label = _get_instance_label(inst)
+    seg_id = inst.gp_segment_id
+    
+    # Get WAL segment size and timeline
+    wal_seg_size, timeline_id = _get_wal_segment_info(inst, gp_home)
+    
+    # List required WAL files
+    required_wals = _list_wal_files_between_lsns(current_lsn, target_lsn, timeline_id, wal_seg_size)
+    
+    if not required_wals:
+        print(f"[DR]{label} No WAL files needed (current={current_lsn}, target={target_lsn})")
+        return seg_id, []
+    
+    print(f"[DR]{label} Checking {len(required_wals)} WAL files (current={current_lsn}, target={target_lsn})")
+    
+    # Check each WAL file
+    missing = []
+    archive_dir = cfg.archive_dir
+    custom_cmd = _get_wal_check_command(cfg, seg_id)
+    
+    for wal_file in required_wals[:100]:  # Limit to first 100
+        if not _check_wal_file_exists(archive_dir, wal_file, inst.host, inst.is_local, custom_cmd):
+            missing.append(wal_file)
+    
+    if missing:
+        print(f"[DR]{label} ❌ Missing {len(missing)} WAL file(s), first few: {missing[:5]}")
+    else:
+        print(f"[DR]{label} ✅ All required WAL files present")
+    
+    return seg_id, missing
 
 # =============================
 # Cycle (your proven “all DOWN = success” logic)
@@ -905,23 +1058,58 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     
     print("[DR] ✅ Pre-flight passed: All required WAL files are present")
 
-    print("[DR] Applying recovery_target_name and recovery_target_action='shutdown' + start...")
-    for seg_id, inst in instances.items():
-        check_stop()
-        tgt_lsn = target_lsns.get(seg_id)
-        if not tgt_lsn:
-            raise RuntimeError(f"[DR][seg={seg_id}] target manifest missing restore_lsn")
+    # =============================
+    # Parallel Phase 1: Configure all instances
+    # =============================
+    print("[DR] Applying recovery_target_name and recovery_target_action='shutdown'...")
+    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        futures = {}
+        for seg_id, inst in instances.items():
+            tgt_lsn = target_lsns.get(seg_id)
+            if not tgt_lsn:
+                raise RuntimeError(f"[DR][seg={seg_id}] target manifest missing restore_lsn")
+            
+            future = executor.submit(
+                configure_instance_recovery,
+                inst,
+                cfg.gp_home,
+                target_rp,
+            )
+            futures[future] = seg_id
+        
+        # Wait for all configurations to complete - fail fast on exceptions
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                seg_id = futures[future]
+                label = "[coord]" if seg_id == -1 else f"[seg={seg_id}]"
+                print(f"[DR]{label} Configuration failed: {e}")
+                raise
 
-        print(f"[DR][seg={seg_id}] apply target_name={target_rp} and start")
-        ensure_standby_signal(inst)
-        set_recovery_target_action_shutdown(inst)
-        #set_recovery_target_lsn(inst, tgt_lsn)
-        clear_recovery_targets(inst)
-        set_recovery_target_name(inst, target_rp)
-        _pg_ctl_stop(inst, cfg.gp_home)
-        time.sleep(1)
-        _preflight(inst, cfg.gp_home)
-        _pg_ctl_start(inst, cfg.gp_home)
+    # =============================
+    # Parallel Phase 2: Stop, preflight, and start all instances
+    # =============================
+    print("[DR] Starting all instances in utility mode...")
+    with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+        futures = {}
+        for seg_id, inst in instances.items():
+            future = executor.submit(
+                start_instance,
+                inst,
+                cfg.gp_home,
+            )
+            futures[future] = seg_id
+        
+        # Wait for all starts to complete - fail fast on exceptions
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                seg_id = futures[future]
+                label = "[coord]" if seg_id == -1 else f"[seg={seg_id}]"
+                print(f"[DR]{label} Start failed: {e}")
+                raise
 
     print(
         f"[DR] Waiting for shutdown-at-target confirmation "
@@ -931,38 +1119,37 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     waited = 0
     while waited <= cfg.consumer_wait_reach_secs:
         check_stop()
+        
+        # =============================
+        # Parallel Phase 3: Check progress of all instances
+        # =============================
         all_down = True
-
-        for seg_id, inst in instances.items():
-            tgt_lsn = target_lsns[seg_id]
-
-            rp, logfile = last_stopped_restore_point_scan(inst, k_files=5, tail_n=1500)
-            if rp:
-                print(f"[DR][seg={seg_id}] LOG stop_restore_point={rp} file={logfile}")
-            else:
-                print(f"[DR][seg={seg_id}] LOG no stop signature found (tail) file={logfile or '-'}")
-
-            ok, replay, _ = try_sql(inst.host, inst.port, user, db, "SELECT pg_last_wal_replay_lsn();")
-            if ok and replay:
-                replay_s = replay.strip()
-                reached = lsn_ge(replay_s, tgt_lsn)
-                print(f"[DR][seg={seg_id}] UP replay_lsn={replay_s} target_lsn={tgt_lsn} reached={reached}")
-                if not reached:
-                    all_down = False
-                continue
-
-            # DOWN: confirm via pg_controldata
-            floor = _pg_controldata_min_recovery_end_lsn(inst, cfg.gp_home)
-            if floor and lsn_ge(floor, tgt_lsn):
-                print(f"[DR][seg={seg_id}] DOWN controldata_ok min_recovery_end_lsn={floor} >= target_lsn={tgt_lsn}")
-            else:
-                ok_cd, lsns = controldata_reached_target(inst, cfg.gp_home, tgt_lsn)
-                if ok_cd:
-                    print(f"[DR][seg={seg_id}] DOWN controldata_ok {lsns}")
-                else:
-                    print(f"[DR][seg={seg_id}] DOWN not_confirmed {lsns or 'no_controldata'} < target_lsn={tgt_lsn}")
-                    all_down = False
-
+        
+        with ThreadPoolExecutor(max_workers=len(instances)) as executor:
+            futures = {}
+            for seg_id, inst in instances.items():
+                tgt_lsn = target_lsns[seg_id]
+                future = executor.submit(
+                    check_instance_progress,
+                    inst,
+                    cfg.gp_home,
+                    user,
+                    db,
+                    tgt_lsn,
+                )
+                futures[future] = seg_id
+            
+            # Collect results - fail fast on exceptions
+            for future in as_completed(futures):
+                try:
+                    reached_target, replay_lsn, recovery_point = future.result()
+                    if not reached_target:
+                        all_down = False
+                except Exception as e:
+                    seg_id = futures[future]
+                    label = "[coord]" if seg_id == -1 else f"[seg={seg_id}]"
+                    print(f"[DR]{label} Progress check failed: {e}")
+                    raise
 
         if all_down:
             # Validate recovery points from logs
