@@ -448,7 +448,7 @@ def _set_current_restore_point(cfg: Config, rp: str) -> None:
 # =============================
 def _get_wal_segment_info(inst: DrInstance, gp_home: str) -> Tuple[int, int]:
     """
-    Get WAL segment size and current timeline ID from pg_controldata.
+    Get WAL segment size and current timeline ID from pg_controldata and timeline history files.
     Returns (wal_segment_size_bytes, timeline_id).
     """
     pgcd = f"{gp_home}/bin/pg_controldata"
@@ -464,10 +464,38 @@ def _get_wal_segment_info(inst: DrInstance, gp_home: str) -> Tuple[int, int]:
         if m:
             wal_seg_size = int(m.group(1))
         
-        # Look for timeline
+        # Look for timeline from pg_controldata
         m = re.search(r"Latest checkpoint's TimeLineID:\s+(\d+)", out)
         if m:
             timeline_id = int(m.group(1))
+    
+    # Check for timeline history files to get the most accurate current timeline
+    # Timeline history files are named like 00000002.history, 00000003.history, etc.
+    # The highest numbered .history file + 1 is the current timeline (or the value itself if on that timeline)
+    wal_dir = f"{inst.data_dir}/pg_wal"
+    # Try pg_wal first (PG 10+), fall back to pg_xlog (PG 9.6 and earlier)
+    history_cmd = (
+        f"ls {sh_quote(wal_dir)}/*.history 2>/dev/null || "
+        f"ls {sh_quote(inst.data_dir)}/pg_xlog/*.history 2>/dev/null || true"
+    )
+    
+    history_out = run(["bash", "-lc", history_cmd], check=False) if inst.is_local else ssh_bash(inst.host, history_cmd, check=False)
+    
+    if history_out and history_out.strip():
+        # Parse timeline from history filenames
+        max_timeline = timeline_id  # Start with pg_controldata value
+        for line in history_out.strip().splitlines():
+            # Extract timeline number from filename like /path/00000003.history
+            m = re.search(r"/([0-9A-Fa-f]{8})\.history", line)
+            if m:
+                tl = int(m.group(1), 16)
+                if tl > max_timeline:
+                    max_timeline = tl
+        
+        # If we found history files, the current timeline is likely the max + 1
+        # or we're on the timeline of the latest history file
+        if max_timeline > timeline_id:
+            timeline_id = max_timeline
     
     return wal_seg_size, timeline_id
 
