@@ -401,10 +401,15 @@ def _manifest_ready(m: dict) -> bool:
 
 
 def _load_target_manifest(cfg: Config, target: str) -> Optional[dict]:
+    """
+    Load target manifest. If target is "LATEST", always use LATEST.json when ready.
+    Do not fall back to older manifests if LATEST exists but is not ready.
+    """
     manifest_dir = Path(cfg.manifest_dir)
     latest_path = Path(cfg.latest_path)
 
     if target != "LATEST":
+        # Specific target requested
         p = manifest_dir / f"{target}.json"
         if not p.exists():
             print(f"[DR] ERROR: manifest not found: {p}")
@@ -412,13 +417,14 @@ def _load_target_manifest(cfg: Config, target: str) -> Optional[dict]:
         m = json.loads(p.read_text())
         return m if _manifest_ready(m) else None
 
+    # target == "LATEST": always use LATEST.json, do not fall back
     if not latest_path.exists():
         print("[DR] No LATEST manifest exists.")
         return None
 
     m = json.loads(latest_path.read_text())
     if not _manifest_ready(m):
-        print("[DR] LATEST manifest not ready/valid yet.")
+        print("[DR] LATEST manifest not ready/valid yet. Will not use older manifests.")
         return None
     return m
 
@@ -435,6 +441,176 @@ def _set_current_restore_point(cfg: Config, rp: str) -> None:
     state_file = Path(cfg.state_dir) / "current_restore_point.txt"
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(rp + "\n")
+
+
+# =============================
+# WAL file helpers
+# =============================
+def _get_wal_segment_info(inst: DrInstance, gp_home: str) -> Tuple[int, int]:
+    """
+    Get WAL segment size and current timeline ID from pg_controldata.
+    Returns (wal_segment_size_bytes, timeline_id).
+    """
+    pgcd = f"{gp_home}/bin/pg_controldata"
+    cmd = f"{pgcd} {sh_quote(inst.data_dir)}"
+    out = run(["bash", "-lc", cmd], check=False) if inst.is_local else gpssh_bash(inst.host, cmd, check=False)
+    
+    wal_seg_size = 64 * 1024 * 1024  # default 64MB
+    timeline_id = 1  # default
+    
+    if out:
+        # Look for "Bytes per WAL segment:"
+        m = re.search(r"Bytes per WAL segment:\s+(\d+)", out)
+        if m:
+            wal_seg_size = int(m.group(1))
+        
+        # Look for timeline
+        m = re.search(r"Latest checkpoint's TimeLineID:\s+(\d+)", out)
+        if m:
+            timeline_id = int(m.group(1))
+    
+    return wal_seg_size, timeline_id
+
+
+def _wal_filename_for_lsn(lsn: str, timeline_id: int, wal_seg_size: int) -> str:
+    """
+    Convert LSN to WAL filename given timeline and segment size.
+    Returns filename like "000000010000000900000065".
+    """
+    lsn_int = lsn_to_int(lsn)
+    seg_no = lsn_int // wal_seg_size
+    
+    # WAL filename format: TTTTTTTTXXXXXXXXYYYYYYYY
+    # where T=timeline (8 hex), X=high 32 bits of seg_no, Y=low 32 bits
+    high = (seg_no >> 32) & 0xFFFFFFFF
+    low = seg_no & 0xFFFFFFFF
+    
+    return f"{timeline_id:08X}{high:08X}{low:08X}"
+
+
+def _list_wal_files_between_lsns(start_lsn: str, end_lsn: str, timeline_id: int, wal_seg_size: int) -> List[str]:
+    """
+    List all WAL filenames needed between start_lsn (exclusive) and end_lsn (inclusive).
+    """
+    start_int = lsn_to_int(start_lsn)
+    end_int = lsn_to_int(end_lsn)
+    
+    if start_int >= end_int:
+        return []
+    
+    start_seg = (start_int // wal_seg_size) + 1  # Next segment after start
+    end_seg = end_int // wal_seg_size
+    
+    files = []
+    for seg_no in range(start_seg, end_seg + 1):
+        high = (seg_no >> 32) & 0xFFFFFFFF
+        low = seg_no & 0xFFFFFFFF
+        filename = f"{timeline_id:08X}{high:08X}{low:08X}"
+        files.append(filename)
+    
+    return files
+
+
+def _check_wal_file_exists(archive_dir: str, wal_filename: str, host: str, is_local: bool) -> bool:
+    """
+    Check if a WAL file exists in the archive directory (local or remote).
+    """
+    wal_path = f"{archive_dir}/{wal_filename}"
+    script = f"test -f {sh_quote(wal_path)} && echo 'EXISTS' || echo 'MISSING'"
+    
+    out = run(["bash", "-lc", script], check=False) if is_local else ssh_bash(host, script, check=False)
+    return "EXISTS" in (out or "")
+
+
+def _preflight_wal_check(
+    cfg: Config,
+    instances: Dict[int, DrInstance],
+    current_rp: str,
+    target_rp: str,
+    target_lsns: Dict[int, str],
+) -> Tuple[bool, Dict[int, List[str]]]:
+    """
+    Pre-flight check: verify all required WAL files exist before starting recovery.
+    
+    Returns (all_present, missing_by_segment) where:
+    - all_present: True if all WAL files are present
+    - missing_by_segment: dict of segment_id -> list of missing WAL filenames
+    """
+    print("[DR] Pre-flight: checking WAL availability...")
+    
+    # Get current state LSNs from pg_controldata
+    current_lsns: Dict[int, str] = {}
+    for seg_id, inst in instances.items():
+        lsns = controldata_lsns(inst, cfg.gp_home)
+        # Use the highest LSN as current position
+        current_lsn = lsns.get("min_recovery_end_lsn") or lsns.get("latest_checkpoint_lsn") or "0/0"
+        current_lsns[seg_id] = current_lsn
+    
+    missing_by_segment: Dict[int, List[str]] = {}
+    all_present = True
+    
+    for seg_id, inst in instances.items():
+        start_lsn = current_lsns.get(seg_id, "0/0")
+        end_lsn = target_lsns.get(seg_id, "0/0")
+        
+        # Get WAL segment size and timeline
+        wal_seg_size, timeline_id = _get_wal_segment_info(inst, cfg.gp_home)
+        
+        # List required WAL files
+        required_wals = _list_wal_files_between_lsns(start_lsn, end_lsn, timeline_id, wal_seg_size)
+        
+        if not required_wals:
+            print(f"[DR][seg={seg_id}] No WAL files needed (current={start_lsn}, target={end_lsn})")
+            continue
+        
+        print(f"[DR][seg={seg_id}] Checking {len(required_wals)} WAL files (current={start_lsn}, target={end_lsn})")
+        
+        # Check each WAL file
+        missing = []
+        archive_dir = cfg.archive_dir
+        
+        for wal_file in required_wals[:100]:  # Limit check to first 100 to avoid overwhelming
+            if not _check_wal_file_exists(archive_dir, wal_file, inst.host, inst.is_local):
+                missing.append(wal_file)
+        
+        if missing:
+            missing_by_segment[seg_id] = missing
+            all_present = False
+            print(f"[DR][seg={seg_id}] ❌ Missing {len(missing)} WAL file(s), first few: {missing[:5]}")
+        else:
+            print(f"[DR][seg={seg_id}] ✅ All required WAL files present")
+    
+    return all_present, missing_by_segment
+
+
+def _validate_recovery_points(
+    instances: Dict[int, DrInstance],
+    target_rp: str,
+) -> Tuple[bool, Dict[int, Optional[str]]]:
+    """
+    Validate that all segments stopped at the expected restore point.
+    
+    Returns (all_match, recovery_points) where:
+    - all_match: True if all segments stopped at target_rp
+    - recovery_points: dict of segment_id -> actual recovery_point found (or None)
+    """
+    recovery_points: Dict[int, Optional[str]] = {}
+    all_match = True
+    
+    for seg_id, inst in instances.items():
+        rp, logfile = last_stopped_restore_point_scan(inst, k_files=5, tail_n=1500)
+        recovery_points[seg_id] = rp
+        
+        if rp != target_rp:
+            all_match = False
+            if rp:
+                print(f"[DR][seg={seg_id}] ❌ Recovery point mismatch: expected={target_rp}, actual={rp}")
+            else:
+                print(f"[DR][seg={seg_id}] ❌ No recovery point found in logs (expected={target_rp})")
+        else:
+            print(f"[DR][seg={seg_id}] ✅ Recovery point matches: {rp}")
+    
+    return all_match, recovery_points
 
 
 # =============================
@@ -474,14 +650,38 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
     instances = load_instances(cfg)
     target_lsns = {int(s["gp_segment_id"]): str(s["restore_lsn"]).strip() for s in target_manifest["segments"]}
 
-    print("[DR] Applying recovery_target_lsn (per instance) and recovery_target_action='shutdown' + start...")
+    # Pre-flight WAL availability check
+    wal_check_ok, missing_wals = _preflight_wal_check(cfg, instances, current_rp, target_rp, target_lsns)
+    
+    if not wal_check_ok:
+        print("[DR] ❌ Pre-flight FAILED: Missing WAL files detected. Will NOT start recovery.")
+        print("[DR] Missing WAL summary:")
+        for seg_id, missing in missing_wals.items():
+            print(f"  seg={seg_id}: {len(missing)} missing, first 5: {missing[:5]}")
+        
+        # Write receipt for failed pre-flight
+        atomic_write_json(
+            receipts_dir / f"{target_rp}.preflight_failed.json",
+            {
+                "current_restore_point": current_rp,
+                "target_restore_point": target_rp,
+                "checked_at_utc": utc_now_iso(),
+                "status": "preflight_failed_missing_wal",
+                "missing_wals_by_segment": {str(k): v for k, v in missing_wals.items()},
+            },
+        )
+        return 0
+    
+    print("[DR] ✅ Pre-flight passed: All required WAL files are present")
+
+    print("[DR] Applying recovery_target_name and recovery_target_action='shutdown' + start...")
     for seg_id, inst in instances.items():
         check_stop()
         tgt_lsn = target_lsns.get(seg_id)
         if not tgt_lsn:
             raise RuntimeError(f"[DR][seg={seg_id}] target manifest missing restore_lsn")
 
-        print(f"[DR][seg={seg_id}] apply target_lsn={tgt_lsn} and start")
+        print(f"[DR][seg={seg_id}] apply target_name={target_rp} and start")
         ensure_standby_signal(inst)
         set_recovery_target_action_shutdown(inst)
         #set_recovery_target_lsn(inst, tgt_lsn)
@@ -530,31 +730,47 @@ def _cycle(cfg: Config, target: str = "LATEST") -> int:
                     print(f"[DR][seg={seg_id}] DOWN controldata_ok {lsns}")
                 else:
                     print(f"[DR][seg={seg_id}] DOWN not_confirmed {lsns or 'no_controldata'} < target_lsn={tgt_lsn}")
-                    all_done = False
+                    all_down = False
 
 
         if all_down:
-            rp, logfile = last_stopped_restore_point_scan(inst, k_files=5, tail_n=1500)
-            if rp:
-                print(f"[DR][seg={seg_id}] LOG stop_restore_point={rp} file={logfile}")
+            # Validate recovery points from logs
+            print("[DR] All instances DOWN. Validating recovery points from logs...")
+            rp_match, recovery_points = _validate_recovery_points(instances, target_rp)
+            
+            if rp_match:
+                print(f"[DR] ✅ SUCCESS: All segments stopped at restore point '{target_rp}'. Advancing state.")
+                _set_current_restore_point(cfg, target_rp)
+                atomic_write_json(
+                    receipts_dir / f"{target_rp}.receipt.json",
+                    {
+                        "current_restore_point": current_rp,
+                        "target_restore_point": target_rp,
+                        "checked_at_utc": utc_now_iso(),
+                        "mode": "shutdown",
+                        "status": "success_recovery_point_validated",
+                        "waited_secs": waited,
+                        "target_lsns": {str(k): v for k, v in target_lsns.items()},
+                        "recovery_points": {str(k): v for k, v in recovery_points.items()},
+                    },
+                )
+                return 0
             else:
-                print(f"[DR][seg={seg_id}] LOG no stop signature found (tail) file={logfile or '-'}")
-
-            print("[DR] ✅ All instances appear DOWN (expected after shutdown target). Advancing state.")
-            _set_current_restore_point(cfg, target_rp)
-            atomic_write_json(
-                receipts_dir / f"{target_rp}.receipt.json",
-                {
-                    "current_restore_point": current_rp,
-                    "target_restore_point": target_rp,
-                    "checked_at_utc": utc_now_iso(),
-                    "mode": "shutdown",
-                    "status": "reached_then_shutdown_best_effort",
-                    "waited_secs": waited,
-                    "target_lsns": {str(k): v for k, v in target_lsns.items()},
-                },
-            )
-            return 0
+                print(f"[DR] ⚠️  All instances DOWN but recovery points don't match. Will retry next cycle.")
+                atomic_write_json(
+                    receipts_dir / f"{target_rp}.recovery_point_mismatch.json",
+                    {
+                        "current_restore_point": current_rp,
+                        "target_restore_point": target_rp,
+                        "checked_at_utc": utc_now_iso(),
+                        "mode": "shutdown",
+                        "status": "recovery_point_mismatch",
+                        "waited_secs": waited,
+                        "target_lsns": {str(k): v for k, v in target_lsns.items()},
+                        "actual_recovery_points": {str(k): v for k, v in recovery_points.items()},
+                    },
+                )
+                return 0
 
         time.sleep(cfg.consumer_reach_poll_secs)
         waited += cfg.consumer_reach_poll_secs
