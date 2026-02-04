@@ -579,4 +579,4 @@ Data Platform & PostgreSQL Leader
 Open Source • Enterprise Postgres • AI-aware Data Platforms
 
 - GitHub: https://github.com/vibhorkum
-- LinkedIn: https://www.linkedin.com/in/vibhorkumar/
+- LinkedIn: https://www.linkedin.com/in/vibhork/
