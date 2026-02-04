@@ -32,7 +32,7 @@ No ambiguity. No "probably caught up." Either the system is parked at a known re
 
 ## Key Features
 
-### Production-Grade Reliability
+### Production Reliability
 
 * **Pre-flight WAL Availability Checks** - Verifies all required WAL files exist before starting recovery
 * **Recovery Point Validation** - Confirms instances stopped at correct restore point before advancing state
