@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -19,7 +20,8 @@ from .service import write_pid, remove_pid
 # Shell helpers
 # =============================
 def sh_quote(s: str) -> str:
-    return "'" + s.replace("'", "'\"'\"'") + "'"
+    """Safely quote a string for shell use."""
+    return shlex.quote(s)
 
 def ssh_bash(host: str, script: str, check: bool = True) -> str:
     # Use a non-interactive, non-login shell to keep output stable

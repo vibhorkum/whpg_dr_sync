@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -57,9 +60,133 @@ class Config:
     wal_check_commands: Dict[int, str]  # Per-segment/coordinator custom commands (segment_id -> command)
 
 
-def load_config(path: str) -> Config:
+class ConfigValidationError(Exception):
+    """Raised when configuration validation fails."""
+
+    def __init__(self, errors: List[str]):
+        self.errors = errors
+        super().__init__(f"Configuration validation failed: {'; '.join(errors)}")
+
+
+def validate_config(raw: Dict[str, Any]) -> List[str]:
+    """
+    Validate configuration structure and return list of errors.
+
+    Args:
+        raw: Parsed JSON configuration dictionary
+
+    Returns:
+        List of validation error messages (empty if valid)
+    """
+    errors: List[str] = []
+
+    # Check required top-level sections
+    required_sections = ["primary", "storage", "archive", "dr"]
+    for section in required_sections:
+        if section not in raw:
+            errors.append(f"Missing required section: '{section}'")
+
+    # Validate primary connection settings
+    if "primary" in raw:
+        primary = raw["primary"]
+        for field in ["host", "port", "user", "db"]:
+            if field not in primary:
+                errors.append(f"Missing primary.{field}")
+            elif field == "port":
+                try:
+                    port = int(primary[field])
+                    if port < 1 or port > 65535:
+                        errors.append(f"primary.port must be 1-65535, got {port}")
+                except (ValueError, TypeError):
+                    errors.append(f"primary.port must be an integer")
+
+    # Validate storage settings
+    if "storage" in raw:
+        storage = raw["storage"]
+        for field in ["manifest_dir", "latest_path"]:
+            if field not in storage:
+                errors.append(f"Missing storage.{field}")
+
+    # Validate archive settings
+    if "archive" in raw:
+        if "archive_dir" not in raw["archive"]:
+            errors.append("Missing archive.archive_dir")
+
+    # Validate DR settings
+    if "dr" in raw:
+        dr = raw["dr"]
+        for field in ["gp_home", "state_dir", "receipts_dir", "instances"]:
+            if field not in dr:
+                errors.append(f"Missing dr.{field}")
+
+        # Validate instances
+        if "instances" in dr:
+            instances = dr["instances"]
+            if not isinstance(instances, list):
+                errors.append("dr.instances must be a list")
+            elif len(instances) == 0:
+                errors.append("dr.instances cannot be empty")
+            else:
+                seen_seg_ids: set = set()
+                for i, inst in enumerate(instances):
+                    inst_prefix = f"dr.instances[{i}]"
+                    for field in ["gp_segment_id", "host", "port", "data_dir"]:
+                        if field not in inst:
+                            errors.append(f"Missing {inst_prefix}.{field}")
+
+                    if "gp_segment_id" in inst:
+                        seg_id = inst["gp_segment_id"]
+                        if seg_id in seen_seg_ids:
+                            errors.append(f"Duplicate gp_segment_id: {seg_id}")
+                        seen_seg_ids.add(seg_id)
+
+                    if "port" in inst:
+                        try:
+                            port = int(inst["port"])
+                            if port < 1 or port > 65535:
+                                errors.append(f"{inst_prefix}.port must be 1-65535")
+                        except (ValueError, TypeError):
+                            errors.append(f"{inst_prefix}.port must be an integer")
+
+    return errors
+
+
+def load_config(path: str, validate: bool = True) -> Config:
+    """
+    Load and validate configuration from JSON file.
+
+    Args:
+        path: Path to configuration file
+        validate: If True, validate config and raise on errors
+
+    Returns:
+        Config object
+
+    Raises:
+        ConfigValidationError: If validation fails and validate=True
+        FileNotFoundError: If config file doesn't exist
+        json.JSONDecodeError: If config file is not valid JSON
+    """
     p = Path(path)
-    raw = json.loads(p.read_text())
+    if not p.exists():
+        raise FileNotFoundError(f"Configuration file not found: {path}")
+
+    try:
+        raw = json.loads(p.read_text())
+    except json.JSONDecodeError as e:
+        raise json.JSONDecodeError(
+            f"Invalid JSON in configuration file {path}: {e.msg}",
+            e.doc,
+            e.pos,
+        )
+
+    if validate:
+        errors = validate_config(raw)
+        if errors:
+            for err in errors:
+                logger.error("Config validation: %s", err)
+            raise ConfigValidationError(errors)
+
     beh = raw.get("behavior", {})
 
     def geti(k: str, default: int) -> int:

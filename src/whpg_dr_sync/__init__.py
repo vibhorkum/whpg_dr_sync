@@ -1,2 +1,4 @@
-__all__ = ["__version__"]
+__all__ = ["__version__", "ConfigValidationError"]
 __version__ = "0.1.0"
+
+from .config import ConfigValidationError
