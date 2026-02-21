@@ -124,37 +124,147 @@ def check_primary_connectivity(cfg: Config) -> PreflightCheck:
         )
 
 
-def check_dr_instances_status(cfg: Config) -> Tuple[PreflightCheck, Dict[int, str]]:
-    """Check DR instances are accessible and get their replay LSNs."""
-    lsns = get_dr_replay_lsns(cfg)
-    total = len(cfg.instances)
-    reachable = len(lsns)
+def _ssh_check(host: str, cmd: str, timeout: int = 30) -> Tuple[bool, str]:
+    """Execute SSH command and return (success, output)."""
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", host, cmd],
+            capture_output=True, text=True, timeout=timeout
+        )
+        return p.returncode == 0, (p.stdout or "").strip()
+    except Exception:
+        return False, ""
 
-    if reachable == total:
+
+def _get_controldata_info(host: str, data_dir: str, gp_home: str, is_local: bool) -> Dict[str, str]:
+    """Get pg_controldata info (works when instance is down)."""
+    import re
+    pgcd = f"{gp_home}/bin/pg_controldata"
+    cmd = f"{pgcd} {data_dir} 2>/dev/null"
+
+    try:
+        if is_local:
+            p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
+            out = p.stdout if p.returncode == 0 else ""
+        else:
+            ok, out = _ssh_check(host, cmd)
+            out = out if ok else ""
+
+        info = {}
+        patterns = {
+            "min_recovery_lsn": r"Minimum recovery ending location:\s+([0-9A-Fa-f]+/[0-9A-Fa-f]+)",
+            "checkpoint_lsn": r"Latest checkpoint location:\s+([0-9A-Fa-f]+/[0-9A-Fa-f]+)",
+            "state": r"Database cluster state:\s+(.+)",
+        }
+        for key, pattern in patterns.items():
+            m = re.search(pattern, out)
+            if m:
+                info[key] = m.group(1).strip()
+        return info
+    except Exception:
+        return {}
+
+
+def check_dr_instances_status(cfg: Config) -> Tuple[PreflightCheck, Dict[int, str]]:
+    """
+    Check DR instances are accessible and get their LSNs.
+
+    In whpg_dr_sync architecture, DR instances are typically SHUTDOWN (parked).
+    We check accessibility via SSH and get LSNs from pg_controldata.
+    """
+    lsns: Dict[int, str] = {}
+    accessible_count = 0
+    total = len(cfg.instances)
+
+    for inst in cfg.instances:
+        # Check SSH accessibility (for remote instances)
+        if not inst.is_local:
+            ok, _ = _ssh_check(inst.host, "echo ok", timeout=10)
+            if not ok:
+                continue
+
+        # Get LSN from pg_controldata
+        info = _get_controldata_info(inst.host, inst.data_dir, cfg.gp_home, inst.is_local)
+        if info:
+            accessible_count += 1
+            lsn = info.get("min_recovery_lsn") or info.get("checkpoint_lsn")
+            if lsn:
+                lsns[inst.gp_segment_id] = lsn
+
+    if accessible_count == total:
         return PreflightCheck(
             name="dr_instances_status",
             status=PreflightStatus.PASS,
-            message=f"All {total} DR instances are reachable",
-            details={"total": total, "reachable": reachable, "lsns": lsns}
+            message=f"All {total} DR instances accessible (pg_controldata readable)",
+            details={"total": total, "accessible": accessible_count, "lsns": lsns}
         ), lsns
-    elif reachable > 0:
+    elif accessible_count > 0:
         return PreflightCheck(
             name="dr_instances_status",
             status=PreflightStatus.WARN,
-            message=f"Only {reachable}/{total} DR instances are reachable",
-            details={"total": total, "reachable": reachable, "lsns": lsns}
+            message=f"Only {accessible_count}/{total} DR instances accessible",
+            details={"total": total, "accessible": accessible_count, "lsns": lsns}
         ), lsns
     else:
         return PreflightCheck(
             name="dr_instances_status",
             status=PreflightStatus.FAIL,
-            message="No DR instances are reachable",
-            details={"total": total, "reachable": 0}
+            message="No DR instances accessible (check SSH connectivity)",
+            details={"total": total, "accessible": 0}
         ), lsns
 
 
+def _search_log_for_restore_point(host: str, data_dir: str, is_local: bool, restore_point: str) -> Tuple[bool, Optional[str]]:
+    """
+    Search log files for 'recovery stopping at restore point' message.
+    This is how whpg_dr_sync verifies DR instances reached the target.
+
+    Returns (found, log_file_path)
+    """
+    import re
+    log_dir = f"{data_dir}/log"
+
+    # Get recent CSV log files
+    list_cmd = f"ls -1t {log_dir}/*.csv 2>/dev/null | head -5"
+
+    try:
+        if is_local:
+            p = subprocess.run(["bash", "-c", list_cmd], capture_output=True, text=True, timeout=10)
+            files = p.stdout.strip().splitlines() if p.returncode == 0 else []
+        else:
+            ok, out = _ssh_check(host, list_cmd)
+            files = out.strip().splitlines() if ok else []
+
+        for log_file in files:
+            if not log_file.strip():
+                continue
+
+            # Search for the restore point in this log file
+            search_cmd = f"grep -l 'recovery stopping at restore point.*{restore_point}' {log_file} 2>/dev/null"
+
+            if is_local:
+                p = subprocess.run(["bash", "-c", search_cmd], capture_output=True, text=True, timeout=10)
+                if p.returncode == 0 and p.stdout.strip():
+                    return True, log_file
+            else:
+                ok, out = _ssh_check(host, search_cmd)
+                if ok and out.strip():
+                    return True, log_file
+
+        return False, files[0] if files else None
+    except Exception:
+        return False, None
+
+
 def check_dr_consistency(cfg: Config) -> PreflightCheck:
-    """Check all DR instances are at the same restore point."""
+    """
+    Check all DR instances are at the same restore point.
+
+    Verification methods (in order of precedence):
+    1. Receipt file with validated status
+    2. Log file search for 'recovery stopping at restore point'
+    3. current_restore_point.txt existence
+    """
     state_file = Path(cfg.state_dir) / "current_restore_point.txt"
 
     if not state_file.exists():
@@ -173,28 +283,59 @@ def check_dr_consistency(cfg: Config) -> PreflightCheck:
             message="Current restore point is empty",
         )
 
-    # Check receipt for this restore point
+    # Check receipt for this restore point (primary verification method)
     receipt_file = Path(cfg.receipts_dir) / f"{current_rp}.receipt.json"
     if receipt_file.exists():
         try:
             receipt = json.loads(receipt_file.read_text())
             status = receipt.get("status", "")
             if status in ("success_recovery_point_validated", "stopped_at_target_all"):
-                return PreflightCheck(
-                    name="dr_consistency",
-                    status=PreflightStatus.PASS,
-                    message=f"All DR instances validated at {current_rp}",
-                    details={"restore_point": current_rp, "receipt_status": status}
+                # Also check recovery_points field if available
+                recovery_points = receipt.get("recovery_points", {})
+                all_match = all(
+                    rp == current_rp
+                    for rp in recovery_points.values()
+                    if rp is not None
                 )
+                if all_match or not recovery_points:
+                    return PreflightCheck(
+                        name="dr_consistency",
+                        status=PreflightStatus.PASS,
+                        message=f"All DR instances validated at '{current_rp}' (receipt verified)",
+                        details={
+                            "restore_point": current_rp,
+                            "receipt_status": status,
+                            "recovery_points": recovery_points
+                        }
+                    )
         except json.JSONDecodeError:
             pass
 
-    return PreflightCheck(
-        name="dr_consistency",
-        status=PreflightStatus.WARN,
-        message=f"DR consistency at {current_rp} not fully validated",
-        details={"restore_point": current_rp}
-    )
+    # Fallback: search log files on each instance
+    log_verified = {}
+    for inst in cfg.instances:
+        found, log_file = _search_log_for_restore_point(
+            inst.host, inst.data_dir, inst.is_local, current_rp
+        )
+        log_verified[inst.gp_segment_id] = {"found": found, "log_file": log_file}
+
+    all_found = all(v["found"] for v in log_verified.values())
+
+    if all_found:
+        return PreflightCheck(
+            name="dr_consistency",
+            status=PreflightStatus.PASS,
+            message=f"All DR instances show '{current_rp}' in logs",
+            details={"restore_point": current_rp, "log_verification": log_verified}
+        )
+    else:
+        missing = [seg for seg, v in log_verified.items() if not v["found"]]
+        return PreflightCheck(
+            name="dr_consistency",
+            status=PreflightStatus.WARN,
+            message=f"Restore point '{current_rp}' not confirmed in logs for segments: {missing}",
+            details={"restore_point": current_rp, "log_verification": log_verified}
+        )
 
 
 def check_wal_continuity(cfg: Config, primary_lsn: Optional[str], dr_lsns: Dict[int, str]) -> PreflightCheck:

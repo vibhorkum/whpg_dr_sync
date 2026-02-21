@@ -96,28 +96,60 @@ def get_primary_lsn(cfg: Config) -> Optional[str]:
 
 
 def get_dr_replay_lsns(cfg: Config) -> Dict[int, str]:
-    """Get replay LSNs from all DR instances."""
+    """
+    Get replay LSNs from all DR instances.
+
+    In whpg_dr_sync architecture, DR instances are typically SHUTDOWN.
+    We get LSNs from:
+    1. Latest successful receipt (target_lsns field)
+    2. pg_controldata (if receipt not available)
+    """
     lsns: Dict[int, str] = {}
 
+    # First try to get from latest successful receipt
+    receipts_dir = Path(cfg.receipts_dir)
+    if receipts_dir.exists():
+        receipts = sorted(
+            receipts_dir.glob("*.receipt.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        for receipt_path in receipts[:5]:
+            try:
+                data = json.loads(receipt_path.read_text())
+                if data.get("status") in ("success_recovery_point_validated", "stopped_at_target_all"):
+                    target_lsns = data.get("target_lsns", {})
+                    if target_lsns:
+                        for seg_id_str, lsn in target_lsns.items():
+                            try:
+                                lsns[int(seg_id_str)] = lsn
+                            except (ValueError, TypeError):
+                                pass
+                        if lsns:
+                            return lsns
+            except (json.JSONDecodeError, OSError):
+                continue
+
+    # Fallback: try pg_controldata for each instance
+    import re
     for inst in cfg.instances:
-        env = os.environ.copy()
-        if inst.gp_segment_id >= 0:
-            env["PGOPTIONS"] = "-c gp_session_role=utility"
+        pgcd = f"{cfg.gp_home}/bin/pg_controldata"
+        cmd = f"{pgcd} {inst.data_dir} 2>/dev/null | grep 'Minimum recovery ending location'"
 
         try:
-            p = subprocess.run(
-                ["psql", "-qtA", "-h", inst.host, "-p", str(inst.port),
-                 "-U", cfg.primary_user, "-d", cfg.primary_db,
-                 "-c", "SELECT pg_last_wal_replay_lsn();"],
-                text=True,
-                capture_output=True,
-                timeout=30,
-                env=env,
-            )
-            if p.returncode == 0:
-                lsn = (p.stdout or "").strip()
-                if lsn:
-                    lsns[inst.gp_segment_id] = lsn
+            if inst.is_local:
+                p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
+                out = p.stdout if p.returncode == 0 else ""
+            else:
+                p = subprocess.run(
+                    ["ssh", "-o", "ConnectTimeout=5", inst.host, cmd],
+                    capture_output=True, text=True, timeout=30
+                )
+                out = p.stdout if p.returncode == 0 else ""
+
+            m = re.search(r'([0-9A-Fa-f]+/[0-9A-Fa-f]+)', out)
+            if m:
+                lsns[inst.gp_segment_id] = m.group(1)
         except Exception:
             pass
 

@@ -175,6 +175,56 @@ def check_primary_health(cfg: Config) -> PrimaryHealth:
     )
 
 
+def _get_controldata_lsn(host: str, data_dir: str, gp_home: str, is_local: bool) -> Optional[str]:
+    """Get LSN from pg_controldata (works when instance is down)."""
+    pgcd = f"{gp_home}/bin/pg_controldata"
+    cmd = f"{pgcd} {data_dir} 2>/dev/null | grep -E 'Minimum recovery ending location|Latest checkpoint location' | head -1"
+
+    try:
+        if is_local:
+            p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30)
+            out = p.stdout if p.returncode == 0 else ""
+        else:
+            ok, out, _ = _ssh_check(host, cmd, timeout=30)
+            out = out or ""
+
+        # Parse LSN from output like "Minimum recovery ending location: 0/5000000"
+        import re
+        m = re.search(r'([0-9A-Fa-f]+/[0-9A-Fa-f]+)', out)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _check_instance_process(host: str, data_dir: str, is_local: bool) -> Tuple[bool, Optional[int]]:
+    """Check if postgres process is running for this data_dir."""
+    cmd = f"head -1 {data_dir}/postmaster.pid 2>/dev/null"
+
+    try:
+        if is_local:
+            p = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=10)
+            pid_str = p.stdout.strip() if p.returncode == 0 else ""
+        else:
+            ok, pid_str, _ = _ssh_check(host, cmd)
+            pid_str = pid_str or ""
+
+        if pid_str and pid_str.isdigit():
+            pid = int(pid_str)
+            # Check if process is actually running
+            check_cmd = f"kill -0 {pid} 2>/dev/null && echo running"
+            if is_local:
+                p = subprocess.run(["bash", "-c", check_cmd], capture_output=True, text=True, timeout=5)
+                running = "running" in p.stdout
+            else:
+                ok, out, _ = _ssh_check(host, check_cmd)
+                running = ok and "running" in (out or "")
+
+            return running, pid if running else None
+        return False, None
+    except Exception:
+        return False, None
+
+
 def check_dr_instance_health(
     host: str,
     port: int,
@@ -183,54 +233,61 @@ def check_dr_instance_health(
     db: str,
     data_dir: str,
     is_local: bool,
+    gp_home: str = "/usr/local/greenplum-db",
 ) -> InstanceHealth:
-    """Check health of a single DR instance."""
+    """
+    Check health of a single DR instance.
+
+    NOTE: In whpg_dr_sync architecture, DR instances are typically SHUTDOWN
+    after reaching a restore point. Being DOWN is the expected healthy state.
+
+    Health is determined by:
+    1. pg_controldata (works when down) - get LSN info
+    2. Disk space check (via SSH)
+    3. Process status (running vs parked)
+    """
     checked_at = utc_now_iso()
 
-    # Check SQL connectivity (utility mode for segments)
-    env_opts = "-c gp_session_role=utility" if gp_segment_id >= 0 else ""
+    # Check if instance process is running
+    is_running, pid = _check_instance_process(host, data_dir, is_local)
 
-    ok, result, error = _psql_check(host, port, user, db, "SELECT 1;")
+    # Get LSN from pg_controldata (works whether up or down)
+    controldata_lsn = _get_controldata_lsn(host, data_dir, gp_home, is_local)
 
-    if not ok:
-        # Instance might be down (expected during recovery pause)
-        return InstanceHealth(
-            gp_segment_id=gp_segment_id,
-            host=host,
-            port=port,
-            reachable=False,
-            is_recovering=False,
-            replay_lsn=None,
-            disk_free_bytes=None,
-            disk_free_pct=None,
-            error=error,
-            checked_at=checked_at,
-        )
-
-    # Check if in recovery
-    ok, is_recovery, _ = _psql_check(host, port, user, db, "SELECT pg_is_in_recovery();")
-    is_recovering = is_recovery == "t" if ok else False
-
-    # Get replay LSN
+    # If running, try to get live replay LSN
     replay_lsn = None
-    if is_recovering:
-        ok, replay_lsn, _ = _psql_check(host, port, user, db, "SELECT pg_last_wal_replay_lsn();")
+    is_recovering = False
 
-    # Check disk space
+    if is_running:
+        ok, result, _ = _psql_check(host, port, user, db, "SELECT 1;")
+        if ok:
+            ok, is_recovery, _ = _psql_check(host, port, user, db, "SELECT pg_is_in_recovery();")
+            is_recovering = is_recovery == "t" if ok else False
+
+            if is_recovering:
+                ok, replay_lsn, _ = _psql_check(host, port, user, db, "SELECT pg_last_wal_replay_lsn();")
+
+    # Use controldata LSN if we couldn't get live LSN
+    if not replay_lsn:
+        replay_lsn = controldata_lsn
+
+    # Check disk space (always works via SSH)
     disk_free_bytes = None
     disk_free_pct = None
 
-    disk_cmd = f"df -B1 {data_dir} | tail -1 | awk '{{print $4, $5}}'"
+    disk_cmd = f"df -B1 {data_dir} 2>/dev/null | tail -1 | awk '{{print $4, $5}}'"
     if is_local:
-        ok, disk_out, _ = True, None, None
         try:
             p = subprocess.run(["bash", "-c", disk_cmd], capture_output=True, text=True, timeout=10)
             if p.returncode == 0:
                 disk_out = p.stdout.strip()
+            else:
+                disk_out = ""
         except Exception:
-            pass
+            disk_out = ""
     else:
         ok, disk_out, _ = _ssh_check(host, disk_cmd)
+        disk_out = disk_out or ""
 
     if disk_out:
         parts = disk_out.split()
@@ -241,16 +298,20 @@ def check_dr_instance_health(
             except (ValueError, IndexError):
                 pass
 
+    # For DR instances, being DOWN (parked at restore point) is normal/healthy
+    # We consider it "reachable" if we can get controldata info
+    reachable = controldata_lsn is not None or is_running
+
     return InstanceHealth(
         gp_segment_id=gp_segment_id,
         host=host,
         port=port,
-        reachable=True,
-        is_recovering=is_recovering,
+        reachable=reachable,
+        is_recovering=is_recovering or (not is_running),  # Parked = recovering state
         replay_lsn=replay_lsn,
         disk_free_bytes=disk_free_bytes,
         disk_free_pct=disk_free_pct,
-        error=None,
+        error=None if reachable else "Cannot read pg_controldata",
         checked_at=checked_at,
     )
 
@@ -389,6 +450,7 @@ def perform_health_check(cfg: Config, check_primary: bool = True) -> HealthStatu
             warnings.append(f"Primary archiver has {primary_health.archiver_failed_count} failed attempts")
 
     # Check DR instances
+    # Note: In whpg_dr_sync, DR instances are normally SHUTDOWN (parked at restore point)
     dr_instances: Dict[int, InstanceHealth] = {}
     for inst in cfg.instances:
         health = check_dr_instance_health(
@@ -399,14 +461,24 @@ def perform_health_check(cfg: Config, check_primary: bool = True) -> HealthStatu
             db=cfg.primary_db,
             data_dir=inst.data_dir,
             is_local=inst.is_local,
+            gp_home=cfg.gp_home,
         )
         dr_instances[inst.gp_segment_id] = health
 
-        if health.error and "timeout" in health.error.lower():
-            errors.append(f"DR instance {inst.gp_segment_id} timeout: {health.error}")
+        if not health.reachable:
+            errors.append(f"DR instance {inst.gp_segment_id} unreachable (cannot read pg_controldata)")
 
         if health.disk_free_pct is not None and health.disk_free_pct < 10:
             warnings.append(f"DR instance {inst.gp_segment_id} low disk: {health.disk_free_pct:.1f}% free")
+
+    # Check DR state from receipts (the actual source of truth)
+    current_rp_file = Path(cfg.state_dir) / "current_restore_point.txt"
+    if not current_rp_file.exists():
+        warnings.append("No current_restore_point.txt - DR may not be initialized")
+    else:
+        current_rp = current_rp_file.read_text().strip()
+        if not current_rp:
+            warnings.append("current_restore_point.txt is empty")
 
     # Check archive
     archive_health = check_archive_health(cfg)
